@@ -1,0 +1,24 @@
+virtio_console: create the ports' init and lock devices
+
+A tty's settings go back to those of its .init device each time it is
+first opened. virtio console ports had no .init device, so they always
+started out in canonical mode with echo, and there was no way to set
+them up once for programs that open them themselves: OpenComputers II's
+high-level API sends NUL framed JSON over named ports, which has to go
+through unchanged. Set TF_INITLOCK, as uart(4) and ucom(4) do, so
+/dev/ttyV*.init and .lock exist and "stty -f /dev/ttyV0.1.init raw"
+applies to every later open.
+
+diff --git a/sys/dev/virtio/console/virtio_console.c b/sys/dev/virtio/console/virtio_console.c
+index ba8fee849..c240093f1 100644
+--- a/sys/dev/virtio/console/virtio_console.c
++++ b/sys/dev/virtio/console/virtio_console.c
+@@ -236,7 +236,7 @@ static void	 vtcon_disable_interrupts(struct vtcon_softc *);
+ static int	 vtcon_pending_free;
+ 
+ static struct ttydevsw vtcon_tty_class = {
+-	.tsw_flags	= 0,
++	.tsw_flags	= TF_INITLOCK,
+ 	.tsw_open	= vtcon_tty_open,
+ 	.tsw_close	= vtcon_tty_close,
+ 	.tsw_outwakeup	= vtcon_tty_outwakeup,

@@ -99,6 +99,7 @@ usr/bin/hexdump
 usr/bin/id
 usr/bin/ldd
 usr/bin/less
+usr/bin/logger
 usr/bin/login
 usr/bin/mktemp
 usr/bin/more
@@ -136,6 +137,7 @@ usr/bin/zcat
 # --- /usr/sbin
 usr/sbin/chown
 usr/sbin/chroot
+usr/sbin/daemon
 usr/sbin/pw
 usr/sbin/pwd_mkdb
 usr/sbin/syslogd

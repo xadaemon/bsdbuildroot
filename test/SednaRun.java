@@ -32,6 +32,9 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayDeque;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.zip.CRC32;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
@@ -55,7 +58,9 @@ import java.util.Properties;
  *                          a 9p file system tagged "builtin", and the
  *                          mid-level API (oc2,mlapi), emulated with two
  *                          devices: SYSTEM and a redstone interface REDSTN,
- *                          labelled "door"
+ *                          labelled "door"; the RPC console's ports answer
+ *                          the high-level API for that redstone interface
+ *                          ("redstone", "door") and a device "test"
  *   --builtin DIR          what the builtin file system holds (default: empty)
  *   --bootargs STRING      /chosen/bootargs
  *   --send STRING          text to type once WAITFOR has been seen, repeatable;
@@ -127,6 +132,7 @@ public final class SednaRun {
         final UART16550A uart = new UART16550A();
         final int firstFreeIrq;
         Mlapi mlapi = null;
+        Hlapi hlapi = null;
         if (oc2) {
             // The mid-level API page first, at its fixed address, as
             // R5Architecture claims it before the other devices are placed.
@@ -146,6 +152,7 @@ public final class SednaRun {
                 "oc2.rpc.0", "oc2.blob.0", "oc2.event.0");
             rpc.getInterrupt().set(3, board.getInterruptController());
             board.addDevice(rpc);
+            hlapi = new Hlapi(rpc, mlapi.redstone);
             uart.getInterrupt().set(4, board.getInterruptController());
             board.addDevice(uart);
             final File builtin = builtinDir != null ? new File(builtinDir)
@@ -218,6 +225,9 @@ public final class SednaRun {
                 board.initialize();
             }
             board.step(cyclesPerStep);
+            if (hlapi != null) {
+                hlapi.pump();
+            }
 
             int value;
             while ((value = uart.read()) >= 0) {
@@ -498,8 +508,7 @@ public final class SednaRun {
                     case 1 -> new int[]{input[side]};
                     case 2 -> new int[]{output[side]};
                     default -> {
-                        output[side] = Math.min(args[1] & 0xFF, 15);
-                        update(side);
+                        setOutput(side, args[1] & 0xFF);
                         yield new int[0];
                     }
                 };
@@ -510,11 +519,27 @@ public final class SednaRun {
                 update(side);
             }
 
+            java.util.function.BiConsumer<Integer, Integer> listener = (side, level) -> {};
+
+            int input(final int side) {
+                return input[side];
+            }
+
+            int output(final int side) {
+                return output[side];
+            }
+
+            void setOutput(final int side, final int level) {
+                output[side] = Math.max(0, Math.min(level, 15));
+                update(side);
+            }
+
             private void update(final int side) {
                 final int level = Math.max(received[side], output[side]);
                 if (level != input[side]) {
                     input[side] = level;
                     queueEvent(1, 1, side | level << 8);
+                    listener.accept(side, level);
                 }
             }
         }
@@ -549,6 +574,442 @@ public final class SednaRun {
                 interrupt.raiseInterrupt();
             } else {
                 interrupt.lowerInterrupt();
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ //
+    // OC2's high-level API, the host side, see docs/hlapi.md: NUL framed
+    // JSON requests on oc2.rpc.0, payloads on oc2.blob.0, events on
+    // oc2.event.0. Replies are sent at once, OC2 sends most a tick later.
+
+    static final class Hlapi {
+        private static final String REDSTONE_ID = "6f1d7c2a-0d8e-4a43-9b61-5c3e2f7a9d10";
+        private static final String TEST_ID = "0b7e4d1c-2f3a-4e5b-8c6d-7e8f9a0b1c2d";
+        private static final List<String> SIDES = List.of("down", "up", "back", "front", "left", "right");
+        private static final Map<String, Integer> ABSOLUTE = Map.of("north", 3, "south", 2, "west", 4, "east", 5);
+        private static final int MAX_REQUEST = 4096;
+        private static final String OVERSIZED = "\u0000oversized";
+
+        private final VirtIOConsoleDevice.PortView rpc, blob, event;
+        private final Mlapi.Redstone redstone;
+        private final ByteArrayOutputStream request = new ByteArrayOutputStream();
+        private final ByteArrayOutputStream blobIn = new ByteArrayOutputStream();
+        private final Deque<String> requests = new ArrayDeque<>();
+        private final Deque<Byte> rpcOut = new ArrayDeque<>(), blobOut = new ArrayDeque<>(), eventOut = new ArrayDeque<>();
+        private boolean oversized;
+
+        Hlapi(final VirtIOConsoleDevice console, final Mlapi.Redstone redstone) {
+            rpc = console.getPort(0);
+            blob = console.getPort(1);
+            event = console.getPort(2);
+            this.redstone = redstone;
+            redstone.listener = (side, level) -> {
+                final Map<String, Object> data = new LinkedHashMap<>();
+                data.put("side", SIDES.get(side));
+                data.put("value", (long) level);
+                final Map<String, Object> message = message("redstoneChanged", 0, data);
+                message.put("deviceId", REDSTONE_ID);
+                if (event.isPortOpen()) {
+                    queue(eventOut, frame(message));
+                }
+            };
+        }
+
+        void pump() {
+            int b;
+            while ((b = rpc.read()) >= 0) {
+                if (b == 0) {
+                    if (oversized) {
+                        requests.addLast(OVERSIZED);
+                    } else if (request.size() > 0) {
+                        requests.addLast(request.toString(StandardCharsets.UTF_8));
+                    }
+                    request.reset();
+                    oversized = false;
+                } else if (request.size() < MAX_REQUEST) {
+                    request.write(b);
+                } else {
+                    oversized = true;
+                }
+            }
+            while ((b = blob.read()) >= 0) {
+                blobIn.write(b);
+            }
+            while (!requests.isEmpty() && handle(requests.peekFirst())) {
+                requests.removeFirst();
+            }
+            drain(rpc, rpcOut);
+            drain(blob, blobOut);
+            drain(event, eventOut);
+        }
+
+        private static void drain(final VirtIOConsoleDevice.PortView port, final Deque<Byte> out) {
+            // Flush every time: a full port buffer only goes out once the
+            // guest has posted receive buffers again, and only on a flush.
+            port.flush();
+            while (!out.isEmpty() && port.canPutByte()) {
+                port.putByte(out.removeFirst());
+            }
+            port.flush();
+        }
+
+        private static void queue(final Deque<Byte> out, final byte[] bytes) {
+            for (final byte value : bytes) {
+                out.addLast(value);
+            }
+        }
+
+        private static byte[] frame(final Object message) {
+            if (DEBUG) {
+                System.err.println("[hlapi] -> " + Json.write(message));
+            }
+            return ("\0" + Json.write(message) + "\0").getBytes(StandardCharsets.UTF_8);
+        }
+
+        private static Map<String, Object> message(final String type, final long id, final Object data) {
+            final Map<String, Object> message = new LinkedHashMap<>();
+            message.put("type", type);
+            message.put("id", id);
+            message.put("gen", 0L);
+            if (data != null) {
+                message.put("data", data);
+            }
+            return message;
+        }
+
+        private void reply(final String type, final long id, final Object data) {
+            queue(rpcOut, frame(message(type, id, data)));
+        }
+
+        private static final boolean DEBUG = System.getenv("SEDNARUN_HLAPI_DEBUG") != null;
+
+        /** Returns false while the payloads of the request have not all arrived. */
+        private boolean handle(final String text) {
+            if (DEBUG) {
+                System.err.println("[hlapi] <- " + text);
+            }
+            if (text.equals(OVERSIZED)) {
+                reply("error", 0, "message too large");
+                return true;
+            }
+            final Object parsed;
+            try {
+                parsed = Json.parse(text);
+            } catch (final RuntimeException e) {
+                reply("error", 0, "malformed message");
+                return true;
+            }
+            if (!(parsed instanceof final Map<?, ?> message) || !(message.get("type") instanceof final String type)) {
+                reply("error", 0, "malformed message");
+                return true;
+            }
+            final Object rawId = message.get("id");
+            if (rawId != null && !(rawId instanceof Number)) {
+                reply("error", 0, "malformed message");
+                return true;
+            }
+            final long id = rawId == null ? 0 : ((Number) rawId).longValue();
+            final List<byte[]> payloads = new ArrayList<>();
+            if (message.get("blobs") instanceof final List<?> list && !list.isEmpty()) {
+                if (!type.equals("invoke")) {
+                    reply("error", 0, "malformed message");
+                    return true;
+                }
+                int total = 0;
+                for (final Object entry : list) {
+                    if (!(entry instanceof final Map<?, ?> m) || !(m.get("length") instanceof final Number length)
+                        || !(m.get("checksum") instanceof Number)) {
+                        reply("error", 0, "malformed message");
+                        return true;
+                    }
+                    total += length.intValue();
+                }
+                if (blobIn.size() < total) {
+                    return false;
+                }
+                final byte[] bytes = blobIn.toByteArray();
+                int offset = 0;
+                for (final Object entry : list) {
+                    final Map<?, ?> m = (Map<?, ?>) entry;
+                    final int length = ((Number) m.get("length")).intValue();
+                    final byte[] payload = java.util.Arrays.copyOfRange(bytes, offset, offset + length);
+                    offset += length;
+                    final CRC32 crc = new CRC32();
+                    crc.update(payload);
+                    if (crc.getValue() != ((Number) m.get("checksum")).longValue()) {
+                        blobIn.reset();
+                        reply("error", 0, "payload checksum mismatch");
+                        return true;
+                    }
+                    payloads.add(payload);
+                }
+            }
+            blobIn.reset(); // payload bytes not used by this request are discarded
+
+            switch (type) {
+                case "list" -> reply("list", id, List.of(
+                    Map.of("deviceId", REDSTONE_ID, "typeNames", List.of("redstone", "door")),
+                    Map.of("deviceId", TEST_ID, "typeNames", List.of("test"))));
+                case "methods" -> {
+                    final Object device = message.get("data");
+                    if (REDSTONE_ID.equals(device)) {
+                        reply("methods", id, List.of(
+                            method("getRedstoneInput", "int", "Gets the received redstone signal for the specified side.",
+                                param("side", "Side", "the side")),
+                            method("getRedstoneOutput", "int", "Gets the emitted redstone signal for the specified side.",
+                                param("side", "Side", "the side")),
+                            method("setRedstoneOutput", "void", "Sets the emitted redstone signal for the specified side.",
+                                param("side", "Side", "the side"), param("value", "int", "the signal strength"))));
+                    } else if (TEST_ID.equals(device)) {
+                        reply("methods", id, List.of(
+                            method("echo", "byte[]", "Returns the bytes it was given, as a payload.",
+                                param("data", "byte[]", "the bytes")),
+                            method("fail", "void", "Always fails.")));
+                    } else {
+                        reply("error", id, "unknown device");
+                    }
+                }
+                case "invoke" -> invoke(id, message.get("data"), payloads);
+                default -> reply("error", 0, "malformed message");
+            }
+            return true;
+        }
+
+        private static Map<String, Object> method(final String name, final String returnType, final String description,
+                                                  final Map<?, ?>... parameters) {
+            final Map<String, Object> method = new LinkedHashMap<>();
+            method.put("name", name);
+            method.put("returnType", returnType);
+            method.put("description", description);
+            method.put("parameters", List.of(parameters));
+            return method;
+        }
+
+        private static Map<String, Object> param(final String name, final String type, final String description) {
+            final Map<String, Object> parameter = new LinkedHashMap<>();
+            parameter.put("name", name);
+            parameter.put("description", description);
+            parameter.put("type", type);
+            return parameter;
+        }
+
+        private static int side(final Object value) {
+            if (value instanceof final Number number) {
+                final int index = number.intValue();
+                if (index >= 0 && index < SIDES.size()) return index;
+            } else if (value instanceof final String name) {
+                final String lower = name.toLowerCase(java.util.Locale.ROOT);
+                if (SIDES.contains(lower)) return SIDES.indexOf(lower);
+                if (ABSOLUTE.containsKey(lower)) return ABSOLUTE.get(lower);
+            }
+            throw new IllegalArgumentException();
+        }
+
+        private void invoke(final long id, final Object data, final List<byte[]> payloads) {
+            if (!(data instanceof final Map<?, ?> call)) {
+                reply("error", 0, "malformed message");
+                return;
+            }
+            final Object device = call.get("deviceId");
+            final Object name = call.get("name");
+            final List<?> params = call.get("parameters") instanceof final List<?> list ? list : List.of();
+            try {
+                if (REDSTONE_ID.equals(device)) {
+                    switch (String.valueOf(name)) {
+                        case "getRedstoneInput" -> {
+                            if (params.size() != 1) throw new IllegalArgumentException();
+                            reply("result", id, (long) redstone.input(side(params.get(0))));
+                        }
+                        case "getRedstoneOutput" -> {
+                            if (params.size() != 1) throw new IllegalArgumentException();
+                            reply("result", id, (long) redstone.output(side(params.get(0))));
+                        }
+                        case "setRedstoneOutput" -> {
+                            if (params.size() != 2 || !(params.get(1) instanceof final Number level)) {
+                                throw new IllegalArgumentException();
+                            }
+                            redstone.setOutput(side(params.get(0)), level.intValue());
+                            reply("result", id, null);
+                        }
+                        default -> reply("error", id, "unknown method");
+                    }
+                } else if (TEST_ID.equals(device)) {
+                    switch (String.valueOf(name)) {
+                        case "echo" -> {
+                            if (params.size() != 1 || !(params.get(0) instanceof final Map<?, ?> marker)
+                                || !(marker.get("$blob") instanceof final Number index)
+                                || index.intValue() < 0 || index.intValue() >= payloads.size()) {
+                                reply("error", id, "invalid parameter signature");
+                                return;
+                            }
+                            final byte[] payload = payloads.get(index.intValue());
+                            final CRC32 crc = new CRC32();
+                            crc.update(payload);
+                            final Map<String, Object> message = message("result", id, Map.of("$blob", 0L));
+                            message.put("blobs", List.of(Map.of("length", (long) payload.length, "checksum", crc.getValue())));
+                            queue(rpcOut, frame(message));
+                            queue(blobOut, payload);
+                        }
+                        case "fail" -> reply("error", id, "java.lang.IllegalStateException: always fails");
+                        default -> reply("error", id, "unknown method");
+                    }
+                } else {
+                    reply("error", id, "unknown device");
+                }
+            } catch (final IllegalArgumentException e) {
+                reply("error", id, "invalid parameter signature");
+            }
+        }
+    }
+
+    /** Just enough JSON: objects are maps, arrays lists, numbers Long or Double, null is NULL. */
+    static final class Json {
+        static final Object NULL = new Object();
+
+        static String write(final Object value) {
+            final StringBuilder out = new StringBuilder();
+            write(value, out);
+            return out.toString();
+        }
+
+        private static void write(final Object value, final StringBuilder out) {
+            if (value == null || value == NULL) {
+                out.append("null");
+            } else if (value instanceof final Map<?, ?> map) {
+                out.append('{');
+                boolean first = true;
+                for (final Map.Entry<?, ?> entry : map.entrySet()) {
+                    if (!first) out.append(',');
+                    first = false;
+                    write(String.valueOf(entry.getKey()), out);
+                    out.append(':');
+                    write(entry.getValue(), out);
+                }
+                out.append('}');
+            } else if (value instanceof final List<?> list) {
+                out.append('[');
+                for (int i = 0; i < list.size(); i++) {
+                    if (i > 0) out.append(',');
+                    write(list.get(i), out);
+                }
+                out.append(']');
+            } else if (value instanceof final String string) {
+                out.append('"');
+                for (final char c : string.toCharArray()) {
+                    switch (c) {
+                        case '"' -> out.append("\\\"");
+                        case '\\' -> out.append("\\\\");
+                        case '\n' -> out.append("\\n");
+                        case '\r' -> out.append("\\r");
+                        case '\t' -> out.append("\\t");
+                        default -> {
+                            if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+                            else out.append(c);
+                        }
+                    }
+                }
+                out.append('"');
+            } else if (value instanceof final Double d) {
+                out.append(d == Math.rint(d) ? String.format(java.util.Locale.ROOT, "%.1f", d) : d.toString());
+            } else {
+                out.append(value);
+            }
+        }
+
+        static Object parse(final String text) {
+            final int[] pos = {0};
+            final Object value = value(text, pos);
+            skip(text, pos);
+            if (pos[0] != text.length()) throw new IllegalArgumentException("trailing data");
+            return value;
+        }
+
+        private static void skip(final String text, final int[] pos) {
+            while (pos[0] < text.length() && Character.isWhitespace(text.charAt(pos[0]))) pos[0]++;
+        }
+
+        private static Object value(final String text, final int[] pos) {
+            skip(text, pos);
+            if (pos[0] >= text.length()) throw new IllegalArgumentException("end of input");
+            final char c = text.charAt(pos[0]);
+            if (c == '{') {
+                final Map<String, Object> map = new LinkedHashMap<>();
+                pos[0]++;
+                skip(text, pos);
+                if (text.startsWith("}", pos[0])) {
+                    pos[0]++;
+                    return map;
+                }
+                while (true) {
+                    skip(text, pos);
+                    if (!text.startsWith("\"", pos[0])) throw new IllegalArgumentException("key");
+                    final String key = (String) value(text, pos);
+                    skip(text, pos);
+                    if (!text.startsWith(":", pos[0])) throw new IllegalArgumentException("colon");
+                    pos[0]++;
+                    map.put(key, value(text, pos));
+                    skip(text, pos);
+                    if (text.startsWith(",", pos[0])) pos[0]++;
+                    else if (text.startsWith("}", pos[0])) { pos[0]++; return map; }
+                    else throw new IllegalArgumentException("object");
+                }
+            } else if (c == '[') {
+                final List<Object> list = new ArrayList<>();
+                pos[0]++;
+                skip(text, pos);
+                if (text.startsWith("]", pos[0])) {
+                    pos[0]++;
+                    return list;
+                }
+                while (true) {
+                    list.add(value(text, pos));
+                    skip(text, pos);
+                    if (text.startsWith(",", pos[0])) pos[0]++;
+                    else if (text.startsWith("]", pos[0])) { pos[0]++; return list; }
+                    else throw new IllegalArgumentException("array");
+                }
+            } else if (c == '"') {
+                final StringBuilder out = new StringBuilder();
+                pos[0]++;
+                while (true) {
+                    if (pos[0] >= text.length()) throw new IllegalArgumentException("string");
+                    final char d = text.charAt(pos[0]++);
+                    if (d == '"') return out.toString();
+                    if (d != '\\') { out.append(d); continue; }
+                    final char e = text.charAt(pos[0]++);
+                    switch (e) {
+                        case 'b' -> out.append('\b');
+                        case 'f' -> out.append('\f');
+                        case 'n' -> out.append('\n');
+                        case 'r' -> out.append('\r');
+                        case 't' -> out.append('\t');
+                        case 'u' -> {
+                            out.append((char) Integer.parseInt(text.substring(pos[0], pos[0] + 4), 16));
+                            pos[0] += 4;
+                        }
+                        default -> out.append(e);
+                    }
+                }
+            } else if (text.startsWith("true", pos[0])) {
+                pos[0] += 4;
+                return Boolean.TRUE;
+            } else if (text.startsWith("false", pos[0])) {
+                pos[0] += 5;
+                return Boolean.FALSE;
+            } else if (text.startsWith("null", pos[0])) {
+                pos[0] += 4;
+                return NULL;
+            } else {
+                final int start = pos[0];
+                while (pos[0] < text.length() && "+-0123456789.eE".indexOf(text.charAt(pos[0])) >= 0) pos[0]++;
+                final String number = text.substring(start, pos[0]);
+                if (number.isEmpty()) throw new IllegalArgumentException("value");
+                try {
+                    return number.matches("-?\\d+") ? (Object) Long.parseLong(number) : (Object) Double.parseDouble(number);
+                } catch (final NumberFormatException ex) {
+                    throw new IllegalArgumentException(ex);
+                }
             }
         }
     }

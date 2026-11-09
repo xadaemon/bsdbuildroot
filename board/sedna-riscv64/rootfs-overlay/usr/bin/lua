@@ -1,3 +1,1 @@
-#!/bin/sh
-# Lua 5.4: FreeBSD's flua(1), with its built-in posix module.
-exec /usr/libexec/flua "$@"
+../libexec/flua

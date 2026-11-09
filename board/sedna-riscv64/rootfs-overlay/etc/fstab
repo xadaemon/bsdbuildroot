@@ -3,3 +3,5 @@
 tmpfs				/tmp		tmpfs	rw,mode=1777	0	0
 # Logs live in memory, as in the Linux image; the disk is small.
 tmpfs				/var/log	tmpfs	rw,size=1m,mode=755	0	0
+# /run, as on Linux: OC2's bus daemon puts its socket and pid file there.
+tmpfs				/run		tmpfs	rw,size=256k,mode=755	0	0

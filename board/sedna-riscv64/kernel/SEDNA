@@ -40,6 +40,10 @@ options 	FFS
 options 	SOFTUPDATES
 options 	EXT2FS			# the boot area, and OC2's Linux disks
 options 	TMPFS
+# tmpfs refuses to grow while fewer pages than this are free, 4 MB by
+# default: most of what is free on this machine. 512 KB is still above the
+# page daemon's minimum (vm.stats.vm.v_free_min).
+makeoptions	CONF_CFLAGS=-DTMPFS_PAGES_MINRESERVED=128
 options 	P9FS			# virtio 9p host file systems
 options 	GEOM_LABEL		# /dev/ufs/<label>
 options 	ROOTDEVNAME=\"ufs:/dev/ufs/sedna_freebsd\"

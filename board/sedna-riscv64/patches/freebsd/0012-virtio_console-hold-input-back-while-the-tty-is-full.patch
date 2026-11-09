@@ -1,0 +1,171 @@
+virtio_console: hold input back while the tty is full
+
+vtcon handed every received byte to the tty and gave the buffer back to
+the device right away. Once the tty's input queue was full (about 2 KB at
+the default 9600 baud), the rest was dropped without notice. Programs
+that move more than that at once over a port, such as OpenComputers
+II's high-level API, which sends binary payloads of any size over a
+named port, lost data.
+
+While the port is open, hand the tty only what it has room for. Keep the
+rest of the buffer, and with it the device's buffers, until the reader
+makes room, which the tty reports through tsw_inwakeup. The device then
+waits for buffers rather than data being lost, which is also how Linux's
+virtio_console behaves. Input for a port nobody has open is still
+discarded, and console ports are left as they were.
+
+diff --git a/sys/dev/virtio/console/virtio_console.c b/sys/dev/virtio/console/virtio_console.c
+index c240093f1..6d99aec39 100644
+--- a/sys/dev/virtio/console/virtio_console.c
++++ b/sys/dev/virtio/console/virtio_console.c
+@@ -85,6 +85,14 @@ struct vtcon_port {
+ #define VTCON_PORT_FLAG_CONSOLE	0x02
+ #define VTCON_PORT_FLAG_ALIAS	0x04
+ 
++	/*
++	 * An input buffer the tty had no room for all of, held back until
++	 * the reader makes room, see vtcon_port_in().
++	 */
++	char				*vtcport_inbuf;
++	uint32_t			 vtcport_inlen;
++	uint32_t			 vtcport_inoff;
++
+ #if defined(KDB)
+ 	int				 vtcport_alt_break_state;
+ #endif
+@@ -217,6 +225,7 @@ static void	 vtcon_port_submit_event(struct vtcon_port *, uint16_t,
+ static int	 vtcon_tty_open(struct tty *);
+ static void	 vtcon_tty_close(struct tty *);
+ static void	 vtcon_tty_outwakeup(struct tty *);
++static void	 vtcon_tty_inwakeup(struct tty *);
+ static void	 vtcon_tty_free(void *);
+ 
+ static void	 vtcon_get_console_size(struct vtcon_softc *, uint16_t *,
+@@ -240,6 +249,7 @@ static struct ttydevsw vtcon_tty_class = {
+ 	.tsw_open	= vtcon_tty_open,
+ 	.tsw_close	= vtcon_tty_close,
+ 	.tsw_outwakeup	= vtcon_tty_outwakeup,
++	.tsw_inwakeup	= vtcon_tty_inwakeup,
+ 	.tsw_free	= vtcon_tty_free,
+ };
+ 
+@@ -1247,6 +1257,10 @@ static void
+ vtcon_port_drain(struct vtcon_port *port)
+ {
+ 
++	if (port->vtcport_inbuf != NULL) {
++		free(port->vtcport_inbuf, M_DEVBUF);
++		port->vtcport_inbuf = NULL;
++	}
+ 	vtcon_port_drain_bufs(port->vtcport_invq);
+ }
+ 
+@@ -1339,7 +1353,8 @@ vtcon_port_in(struct vtcon_port *port)
+ 	struct tty *tp;
+ 	char *buf;
+ 	uint32_t len;
+-	int i, deq;
++	size_t room, n;
++	int deq;
+ 
+ 	tp = port->vtcport_tty;
+ 	vq = port->vtcport_invq;
+@@ -1347,15 +1362,52 @@ vtcon_port_in(struct vtcon_port *port)
+ again:
+ 	deq = 0;
+ 
+-	while ((buf = virtqueue_dequeue(vq, &len)) != NULL) {
+-		for (i = 0; i < len; i++) {
++	for (;;) {
++		if (port->vtcport_inbuf == NULL) {
++			buf = virtqueue_dequeue(vq, &len);
++			if (buf == NULL)
++				break;
++			port->vtcport_inbuf = buf;
++			port->vtcport_inlen = len;
++			port->vtcport_inoff = 0;
++		}
++		buf = port->vtcport_inbuf;
++
++		while (port->vtcport_inoff < port->vtcport_inlen) {
++			n = port->vtcport_inlen - port->vtcport_inoff;
++			/*
++			 * While the port is open, only hand the tty what it
++			 * has room for, and keep the rest of the buffer until
++			 * the reader makes room (vtcon_tty_inwakeup()). The
++			 * host waits once it runs out of buffers, as with
++			 * Linux, rather than data being dropped. Input for a
++			 * port nobody has open is discarded, as before.
++			 */
++			if (tty_opened(tp) &&
++			    (port->vtcport_flags & VTCON_PORT_FLAG_CONSOLE) == 0) {
++				room = ttyinq_bytesleft(&tp->t_inq);
++				if (room == 0)
++					goto full;
++				n = MIN(n, room);
++			}
++			if (ttydisc_can_bypass(tp) &&
++			    (port->vtcport_flags & VTCON_PORT_FLAG_CONSOLE) == 0) {
++				ttydisc_rint_bypass(tp,
++				    buf + port->vtcport_inoff, n);
++				port->vtcport_inoff += n;
++				continue;
++			}
++			while (n-- > 0) {
+ #if defined(KDB)
+-			if (port->vtcport_flags & VTCON_PORT_FLAG_CONSOLE)
+-				kdb_alt_break(buf[i],
+-				    &port->vtcport_alt_break_state);
++				if (port->vtcport_flags & VTCON_PORT_FLAG_CONSOLE)
++					kdb_alt_break(buf[port->vtcport_inoff],
++					    &port->vtcport_alt_break_state);
+ #endif
+-			ttydisc_rint(tp, buf[i], 0);
++				ttydisc_rint(tp, buf[port->vtcport_inoff], 0);
++				port->vtcport_inoff++;
++			}
+ 		}
++		port->vtcport_inbuf = NULL;
+ 		vtcon_port_requeue_buf(port, buf);
+ 		deq++;
+ 	}
+@@ -1366,6 +1418,12 @@ vtcon_port_in(struct vtcon_port *port)
+ 
+ 	if (virtqueue_enable_intr(vq) != 0)
+ 		goto again;
++	return;
++
++full:
++	ttydisc_rint_done(tp);
++	if (deq > 0)
++		virtqueue_notify(vq);
+ }
+ 
+ static void
+@@ -1452,6 +1510,26 @@ vtcon_tty_close(struct tty *tp)
+ 		return;
+ 
+ 	vtcon_port_submit_event(port, VIRTIO_CONSOLE_PORT_OPEN, 0);
++
++	/* Nobody reads what is held back any more, discard it. */
++	if (port->vtcport_inbuf != NULL) {
++		vtcon_port_requeue_buf(port, port->vtcport_inbuf);
++		port->vtcport_inbuf = NULL;
++		virtqueue_notify(port->vtcport_invq);
++	}
++}
++
++/* The reader made room in the tty's input queue. */
++static void
++vtcon_tty_inwakeup(struct tty *tp)
++{
++	struct vtcon_port *port;
++
++	port = tty_softc(tp);
++
++	if ((port->vtcport_flags & VTCON_PORT_FLAG_GONE) == 0 &&
++	    port->vtcport_inbuf != NULL)
++		vtcon_port_in(port);
+ }
+ 
+ static void

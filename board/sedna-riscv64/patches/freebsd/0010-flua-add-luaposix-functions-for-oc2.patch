@@ -1,0 +1,1101 @@
+flua: add the luaposix functions OpenComputers II's libraries use
+
+OC2's Lua libraries for its high-level API (the "devices" library, and
+the oc2busd daemon that shares the virtio ports between programs) are
+written against luaposix. Add what they use to flua's posix module, with
+luaposix's names and calling conventions (failures return nil, a
+message and the errno value):
+
+- posix.dirent: dir, files
+- posix.errno: errno, and the E* constants
+- posix.fcntl: open, fcntl, and the O_*, F_* and FD_CLOEXEC constants
+- posix.poll: poll (luaposix's table form), rpoll
+- posix.signal: signal (SIG_DFL, SIG_IGN or a Lua function, run at the
+  next safe point through a hook), kill, raise, and the constants
+- posix.sys.socket: socket, bind, connect, listen, accept, shutdown,
+  getsockopt (integer options), send, recv; AF_UNIX addresses only
+- posix.sys.stat: stat, lstat, mkdir, the S_IS* tests and S_I* constants
+- posix.time: clock_gettime, nanosleep, time
+
+diff --git a/libexec/flua/modules/lposix.c b/libexec/flua/modules/lposix.c
+index a25e87504..bbc2db9f8 100644
+--- a/libexec/flua/modules/lposix.c
++++ b/libexec/flua/modules/lposix.c
+@@ -4,18 +4,26 @@
+  * SPDX-License-Identifier: BSD-2-Clause
+  */
+ 
++#include <sys/param.h>
++#include <sys/socket.h>
+ #include <sys/stat.h>
++#include <sys/un.h>
+ #include <sys/utsname.h>
+ #include <sys/wait.h>
+ 
+ #include <assert.h>
++#include <dirent.h>
+ #include <errno.h>
++#include <fcntl.h>
+ #include <fnmatch.h>
+ #include <grp.h>
+ #include <libgen.h>
++#include <poll.h>
+ #include <pwd.h>
++#include <signal.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #include <lua.h>
+@@ -544,6 +552,714 @@ lua_write(lua_State *L)
+ 	return (3);
+ }
+ 
++/*
++ * The parts of luaposix's posix.dirent, posix.errno, posix.fcntl, posix.poll,
++ * posix.signal, posix.sys.socket, posix.sys.stat and posix.time that
++ * OpenComputers II's Lua libraries use, with luaposix's calling conventions:
++ * failures return nil, a message and the errno value.
++ */
++
++static int
++push_error(lua_State *L, int error)
++{
++	lua_pushnil(L);
++	lua_pushstring(L, strerror(error));
++	lua_pushinteger(L, error);
++	return (3);
++}
++
++static int
++push_result(lua_State *L, int ret)
++{
++	if (ret == -1)
++		return (push_error(L, errno));
++	lua_pushinteger(L, ret);
++	return (1);
++}
++
++/* posix.dirent */
++
++static int
++lua_dir(lua_State *L)
++{
++	const char *path;
++	struct dirent *entry;
++	DIR *dir;
++	int i;
++
++	enforce_max_args(L, 1);
++	path = luaL_optstring(L, 1, ".");
++	dir = opendir(path);
++	if (dir == NULL)
++		return (push_error(L, errno));
++	lua_newtable(L);
++	i = 1;
++	while ((entry = readdir(dir)) != NULL) {
++		lua_pushstring(L, entry->d_name);
++		lua_rawseti(L, -2, i++);
++	}
++	closedir(dir);
++	return (1);
++}
++
++static int
++lua_files_next(lua_State *L)
++{
++	DIR **dir = luaL_checkudata(L, 1, "posix.dirent.files");
++	struct dirent *entry;
++
++	if (*dir == NULL)
++		return (0);
++	entry = readdir(*dir);
++	if (entry == NULL) {
++		closedir(*dir);
++		*dir = NULL;
++		return (0);
++	}
++	lua_pushstring(L, entry->d_name);
++	return (1);
++}
++
++static int
++lua_files_gc(lua_State *L)
++{
++	DIR **dir = luaL_checkudata(L, 1, "posix.dirent.files");
++
++	if (*dir != NULL) {
++		closedir(*dir);
++		*dir = NULL;
++	}
++	return (0);
++}
++
++static int
++lua_files(lua_State *L)
++{
++	const char *path;
++	DIR **dir;
++
++	enforce_max_args(L, 1);
++	path = luaL_optstring(L, 1, ".");
++	lua_pushcfunction(L, lua_files_next);
++	dir = lua_newuserdatauv(L, sizeof(*dir), 0);
++	*dir = NULL;
++	if (luaL_newmetatable(L, "posix.dirent.files")) {
++		lua_pushcfunction(L, lua_files_gc);
++		lua_setfield(L, -2, "__gc");
++		lua_pushcfunction(L, lua_files_gc);
++		lua_setfield(L, -2, "__close");
++	}
++	lua_setmetatable(L, -2);
++	*dir = opendir(path);
++	if (*dir == NULL)
++		return (luaL_error(L, "%s: %s", path, strerror(errno)));
++	return (2);
++}
++
++/* posix.errno */
++
++static int
++lua_errno(lua_State *L)
++{
++	int error;
++
++	enforce_max_args(L, 1);
++	error = (int)luaL_optinteger(L, 1, errno);
++	lua_pushstring(L, strerror(error));
++	lua_pushinteger(L, error);
++	return (2);
++}
++
++/* posix.fcntl */
++
++static int
++lua_open(lua_State *L)
++{
++	const char *path;
++	int flags;
++	mode_t mode;
++
++	enforce_max_args(L, 3);
++	path = luaL_checkstring(L, 1);
++	flags = (int)luaL_checkinteger(L, 2);
++	mode = (mode_t)luaL_optinteger(L, 3, 0777);
++	return (push_result(L, open(path, flags, mode)));
++}
++
++static int
++lua_fcntl(lua_State *L)
++{
++	int cmd, fd;
++
++	enforce_max_args(L, 3);
++	fd = (int)luaL_checkinteger(L, 1);
++	cmd = (int)luaL_checkinteger(L, 2);
++	switch (cmd) {
++	case F_GETFD:
++	case F_SETFD:
++	case F_GETFL:
++	case F_SETFL:
++	case F_DUPFD:
++	case F_DUPFD_CLOEXEC:
++	case F_GETOWN:
++	case F_SETOWN:
++		return (push_result(L,
++		    fcntl(fd, cmd, (int)luaL_optinteger(L, 3, 0))));
++	default:
++		return (push_error(L, EINVAL));
++	}
++}
++
++/* posix.poll */
++
++static const struct {
++	const char	*name;
++	short		 bit;
++} poll_events[] = {
++	{ "IN",		POLLIN },
++	{ "PRI",	POLLPRI },
++	{ "OUT",	POLLOUT },
++	{ "RDNORM",	POLLRDNORM },
++	{ "RDBAND",	POLLRDBAND },
++	{ "WRNORM",	POLLWRNORM },
++	{ "WRBAND",	POLLWRBAND },
++	{ "ERR",	POLLERR },
++	{ "HUP",	POLLHUP },
++	{ "NVAL",	POLLNVAL },
++};
++
++static short
++poll_events_from_table(lua_State *L, int index)
++{
++	short events = 0;
++	size_t i;
++
++	if (!lua_istable(L, index))
++		return (0);
++	for (i = 0; i < nitems(poll_events); i++) {
++		lua_getfield(L, index, poll_events[i].name);
++		if (lua_toboolean(L, -1))
++			events |= poll_events[i].bit;
++		lua_pop(L, 1);
++	}
++	return (events);
++}
++
++static void
++poll_events_to_table(lua_State *L, short events)
++{
++	size_t i;
++
++	lua_createtable(L, 0, nitems(poll_events));
++	for (i = 0; i < nitems(poll_events); i++) {
++		lua_pushboolean(L, (events & poll_events[i].bit) != 0);
++		lua_setfield(L, -2, poll_events[i].name);
++	}
++}
++
++/* poll({[fd] = {events = {IN = true, ...}}, ...}, timeout): sets revents. */
++static int
++lua_poll(lua_State *L)
++{
++	struct pollfd *fds;
++	nfds_t i, n;
++	int error, ret, timeout;
++
++	enforce_max_args(L, 2);
++	luaL_checktype(L, 1, LUA_TTABLE);
++	timeout = (int)luaL_optinteger(L, 2, -1);
++
++	n = 0;
++	lua_pushnil(L);
++	while (lua_next(L, 1) != 0) {
++		luaL_argcheck(L, lua_isinteger(L, -2), 1,
++		    "descriptors must be integers");
++		n++;
++		lua_pop(L, 1);
++	}
++
++	fds = lua_newuserdatauv(L, (n > 0 ? n : 1) * sizeof(*fds), 0);
++	i = 0;
++	lua_pushnil(L);
++	while (lua_next(L, 1) != 0) {
++		fds[i].fd = (int)lua_tointeger(L, -2);
++		lua_getfield(L, -1, "events");
++		fds[i].events = poll_events_from_table(L, lua_gettop(L));
++		fds[i].revents = 0;
++		lua_pop(L, 2);
++		i++;
++	}
++
++	ret = poll(fds, n, timeout);
++	if (ret == -1) {
++		error = errno;
++		return (push_error(L, error));
++	}
++
++	for (i = 0; i < n; i++) {
++		lua_rawgeti(L, 1, fds[i].fd);
++		if (lua_istable(L, -1)) {
++			poll_events_to_table(L, fds[i].revents);
++			lua_setfield(L, -2, "revents");
++		}
++		lua_pop(L, 1);
++	}
++	lua_pushinteger(L, ret);
++	return (1);
++}
++
++/* rpoll(fd, timeout): whether fd is readable. */
++static int
++lua_rpoll(lua_State *L)
++{
++	struct pollfd pfd;
++
++	enforce_max_args(L, 2);
++	pfd.fd = (int)luaL_checkinteger(L, 1);
++	pfd.events = POLLIN;
++	pfd.revents = 0;
++	return (push_result(L, poll(&pfd, 1, (int)luaL_checkinteger(L, 2))));
++}
++
++/* posix.signal */
++
++#define	LUA_SIGNAL_HANDLERS	"posix.signal.handlers"
++
++static lua_State *signal_state;
++static volatile sig_atomic_t signal_pending[NSIG];
++static volatile sig_atomic_t signal_any;
++static lua_Hook signal_saved_hook;
++static int signal_saved_mask, signal_saved_count;
++
++static void
++signal_hook(lua_State *L, lua_Debug *ar)
++{
++	int sig;
++
++	(void)ar;
++	lua_sethook(L, signal_saved_hook, signal_saved_mask,
++	    signal_saved_count);
++	while (signal_any) {
++		signal_any = 0;
++		for (sig = 1; sig < NSIG; sig++) {
++			if (!signal_pending[sig])
++				continue;
++			signal_pending[sig] = 0;
++			lua_getfield(L, LUA_REGISTRYINDEX,
++			    LUA_SIGNAL_HANDLERS);
++			lua_rawgeti(L, -1, sig);
++			lua_remove(L, -2);
++			if (lua_isfunction(L, -1)) {
++				lua_pushinteger(L, sig);
++				lua_call(L, 1, 0);
++			} else {
++				lua_pop(L, 1);
++			}
++		}
++	}
++}
++
++/* Runs the Lua handler at the next safe point, through a hook. */
++static void
++signal_catch(int sig)
++{
++	lua_State *L = signal_state;
++
++	signal_pending[sig] = 1;
++	if (signal_any || L == NULL) {
++		signal_any = 1;
++		return;
++	}
++	signal_any = 1;
++	signal_saved_hook = lua_gethook(L);
++	signal_saved_mask = lua_gethookmask(L);
++	signal_saved_count = lua_gethookcount(L);
++	lua_sethook(L, signal_hook,
++	    LUA_MASKCALL | LUA_MASKRET | LUA_MASKCOUNT, 1);
++}
++
++static void
++push_signal_handler(lua_State *L, int sig, void (*handler)(int))
++{
++	if (handler != signal_catch) {
++		lua_pushlightuserdata(L, (void *)handler);
++		return;
++	}
++	lua_getfield(L, LUA_REGISTRYINDEX, LUA_SIGNAL_HANDLERS);
++	lua_rawgeti(L, -1, sig);
++	lua_remove(L, -2);
++}
++
++/* signal(sig[, handler[, flags]]): handler is SIG_DFL, SIG_IGN or a
++ * function; returns the previous one. */
++static int
++lua_signal(lua_State *L)
++{
++	struct sigaction sa, old;
++	int sig;
++
++	enforce_max_args(L, 3);
++	sig = (int)luaL_checkinteger(L, 1);
++	luaL_argcheck(L, sig > 0 && sig < NSIG, 1, "invalid signal");
++
++	memset(&sa, 0, sizeof(sa));
++	sigfillset(&sa.sa_mask);
++	sa.sa_flags = (int)luaL_optinteger(L, 3, 0);
++	if (lua_isnoneornil(L, 2)) {
++		sa.sa_handler = SIG_DFL;
++	} else if (lua_islightuserdata(L, 2)) {
++		sa.sa_handler = (void (*)(int))lua_touserdata(L, 2);
++		luaL_argcheck(L, sa.sa_handler == SIG_DFL ||
++		    sa.sa_handler == SIG_IGN, 2, "SIG_DFL or SIG_IGN expected");
++	} else {
++		luaL_checktype(L, 2, LUA_TFUNCTION);
++		sa.sa_handler = signal_catch;
++	}
++
++	if (sigaction(sig, NULL, &old) == -1)
++		return (push_error(L, errno));
++	push_signal_handler(L, sig, old.sa_handler);
++
++	if (sa.sa_handler == signal_catch) {
++		lua_getfield(L, LUA_REGISTRYINDEX, LUA_SIGNAL_HANDLERS);
++		lua_pushvalue(L, 2);
++		lua_rawseti(L, -2, sig);
++		lua_pop(L, 1);
++		/* Hooks are per thread: run handlers in the main one. */
++		lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
++		signal_state = lua_tothread(L, -1);
++		lua_pop(L, 1);
++	}
++	if (sigaction(sig, &sa, NULL) == -1)
++		return (push_error(L, errno));
++	return (1);
++}
++
++static int
++lua_kill(lua_State *L)
++{
++	enforce_max_args(L, 2);
++	return (push_result(L, kill((pid_t)luaL_checkinteger(L, 1),
++	    (int)luaL_optinteger(L, 2, SIGTERM))));
++}
++
++static int
++lua_raise(lua_State *L)
++{
++	enforce_max_args(L, 1);
++	return (push_result(L, raise((int)luaL_checkinteger(L, 1))));
++}
++
++/* posix.sys.socket, AF_UNIX addresses only. */
++
++static int
++socket_address(lua_State *L, int index, struct sockaddr_un *sun)
++{
++	const char *path;
++	size_t len;
++	int family;
++
++	luaL_checktype(L, index, LUA_TTABLE);
++	lua_getfield(L, index, "family");
++	family = (int)luaL_checkinteger(L, -1);
++	lua_pop(L, 1);
++	if (family != AF_UNIX)
++		return (EAFNOSUPPORT);
++	lua_getfield(L, index, "path");
++	path = luaL_checklstring(L, -1, &len);
++	if (len >= sizeof(sun->sun_path)) {
++		lua_pop(L, 1);
++		return (ENAMETOOLONG);
++	}
++	memset(sun, 0, sizeof(*sun));
++	sun->sun_len = sizeof(*sun);
++	sun->sun_family = AF_UNIX;
++	memcpy(sun->sun_path, path, len);
++	lua_pop(L, 1);
++	return (0);
++}
++
++static void
++push_socket_address(lua_State *L, const struct sockaddr_storage *ss)
++{
++	const struct sockaddr_un *sun = (const struct sockaddr_un *)ss;
++
++	lua_newtable(L);
++	lua_pushinteger(L, ss->ss_family);
++	lua_setfield(L, -2, "family");
++	if (ss->ss_family == AF_UNIX) {
++		lua_pushstring(L, sun->sun_path);
++		lua_setfield(L, -2, "path");
++	}
++}
++
++static int
++lua_socket(lua_State *L)
++{
++	enforce_max_args(L, 3);
++	return (push_result(L, socket((int)luaL_checkinteger(L, 1),
++	    (int)luaL_checkinteger(L, 2), (int)luaL_optinteger(L, 3, 0))));
++}
++
++static int
++lua_bind(lua_State *L)
++{
++	struct sockaddr_un sun;
++	int error;
++
++	enforce_max_args(L, 2);
++	error = socket_address(L, 2, &sun);
++	if (error != 0)
++		return (push_error(L, error));
++	return (push_result(L, bind((int)luaL_checkinteger(L, 1),
++	    (struct sockaddr *)&sun, sizeof(sun))));
++}
++
++static int
++lua_connect(lua_State *L)
++{
++	struct sockaddr_un sun;
++	int error;
++
++	enforce_max_args(L, 2);
++	error = socket_address(L, 2, &sun);
++	if (error != 0)
++		return (push_error(L, error));
++	return (push_result(L, connect((int)luaL_checkinteger(L, 1),
++	    (struct sockaddr *)&sun, sizeof(sun))));
++}
++
++static int
++lua_listen(lua_State *L)
++{
++	enforce_max_args(L, 2);
++	return (push_result(L, listen((int)luaL_checkinteger(L, 1),
++	    (int)luaL_optinteger(L, 2, SOMAXCONN))));
++}
++
++static int
++lua_accept(lua_State *L)
++{
++	struct sockaddr_storage ss;
++	socklen_t len;
++	int fd;
++
++	enforce_max_args(L, 1);
++	len = sizeof(ss);
++	memset(&ss, 0, sizeof(ss));
++	fd = accept((int)luaL_checkinteger(L, 1), (struct sockaddr *)&ss,
++	    &len);
++	if (fd == -1)
++		return (push_error(L, errno));
++	lua_pushinteger(L, fd);
++	push_socket_address(L, &ss);
++	return (2);
++}
++
++static int
++lua_shutdown(lua_State *L)
++{
++	enforce_max_args(L, 2);
++	return (push_result(L, shutdown((int)luaL_checkinteger(L, 1),
++	    (int)luaL_checkinteger(L, 2))));
++}
++
++/* getsockopt(fd, level, name): integer options only. */
++static int
++lua_getsockopt(lua_State *L)
++{
++	socklen_t len;
++	int fd, level, name, value;
++
++	enforce_max_args(L, 3);
++	fd = (int)luaL_checkinteger(L, 1);
++	level = (int)luaL_checkinteger(L, 2);
++	name = (int)luaL_checkinteger(L, 3);
++	if (level != SOL_SOCKET)
++		return (push_error(L, ENOPROTOOPT));
++	switch (name) {
++	case SO_ERROR:
++	case SO_TYPE:
++	case SO_REUSEADDR:
++	case SO_KEEPALIVE:
++	case SO_SNDBUF:
++	case SO_RCVBUF:
++		break;
++	default:
++		return (push_error(L, ENOPROTOOPT));
++	}
++	len = sizeof(value);
++	if (getsockopt(fd, level, name, &value, &len) == -1)
++		return (push_error(L, errno));
++	lua_pushinteger(L, value);
++	return (1);
++}
++
++static int
++lua_recv(lua_State *L)
++{
++	luaL_Buffer b;
++	ssize_t ret;
++	size_t sz;
++	char *buf;
++	int fd;
++
++	enforce_max_args(L, 2);
++	fd = (int)luaL_checkinteger(L, 1);
++	sz = (size_t)luaL_checkinteger(L, 2);
++	buf = luaL_buffinitsize(L, &b, sz);
++	ret = recv(fd, buf, sz, 0);
++	if (ret == -1)
++		return (push_error(L, errno));
++	luaL_pushresultsize(&b, ret);
++	return (1);
++}
++
++static int
++lua_send(lua_State *L)
++{
++	const char *buf;
++	ssize_t ret;
++	size_t sz;
++
++	enforce_max_args(L, 2);
++	buf = luaL_checklstring(L, 2, &sz);
++	ret = send((int)luaL_checkinteger(L, 1), buf, sz, 0);
++	if (ret == -1)
++		return (push_error(L, errno));
++	lua_pushinteger(L, ret);
++	return (1);
++}
++
++/* posix.sys.stat */
++
++static void
++push_stat(lua_State *L, const struct stat *sb)
++{
++	lua_newtable(L);
++#define	setst(f) do {				\
++	lua_pushinteger(L, (lua_Integer)sb->f);	\
++	lua_setfield(L, -2, #f);		\
++} while (0)
++	setst(st_dev);
++	setst(st_ino);
++	setst(st_mode);
++	setst(st_nlink);
++	setst(st_uid);
++	setst(st_gid);
++	setst(st_rdev);
++	setst(st_size);
++	setst(st_blksize);
++	setst(st_blocks);
++	setst(st_atime);
++	setst(st_mtime);
++	setst(st_ctime);
++#undef setst
++}
++
++static int
++lua_stat(lua_State *L)
++{
++	struct stat sb;
++
++	enforce_max_args(L, 1);
++	if (stat(luaL_checkstring(L, 1), &sb) == -1)
++		return (push_error(L, errno));
++	push_stat(L, &sb);
++	return (1);
++}
++
++static int
++lua_lstat(lua_State *L)
++{
++	struct stat sb;
++
++	enforce_max_args(L, 1);
++	if (lstat(luaL_checkstring(L, 1), &sb) == -1)
++		return (push_error(L, errno));
++	push_stat(L, &sb);
++	return (1);
++}
++
++static int
++lua_mkdir(lua_State *L)
++{
++	enforce_max_args(L, 2);
++	return (push_result(L, mkdir(luaL_checkstring(L, 1),
++	    (mode_t)luaL_optinteger(L, 2, 0777))));
++}
++
++#define	S_ISFUNC(f)						\
++static int							\
++lua_##f(lua_State *L)						\
++{								\
++	enforce_max_args(L, 1);					\
++	lua_pushinteger(L, f((mode_t)luaL_checkinteger(L, 1)));	\
++	return (1);						\
++}
++S_ISFUNC(S_ISBLK)
++S_ISFUNC(S_ISCHR)
++S_ISFUNC(S_ISDIR)
++S_ISFUNC(S_ISFIFO)
++S_ISFUNC(S_ISLNK)
++S_ISFUNC(S_ISREG)
++S_ISFUNC(S_ISSOCK)
++#undef S_ISFUNC
++
++/* posix.time */
++
++static void
++push_timespec(lua_State *L, const struct timespec *ts)
++{
++	lua_newtable(L);
++	lua_pushinteger(L, ts->tv_sec);
++	lua_setfield(L, -2, "tv_sec");
++	lua_pushinteger(L, ts->tv_nsec);
++	lua_setfield(L, -2, "tv_nsec");
++}
++
++static int
++lua_clock_gettime(lua_State *L)
++{
++	struct timespec ts;
++
++	enforce_max_args(L, 1);
++	if (clock_gettime((clockid_t)luaL_optinteger(L, 1, CLOCK_REALTIME),
++	    &ts) == -1)
++		return (push_error(L, errno));
++	push_timespec(L, &ts);
++	return (1);
++}
++
++static int
++lua_nanosleep(lua_State *L)
++{
++	struct timespec req, rem;
++
++	enforce_max_args(L, 1);
++	luaL_checktype(L, 1, LUA_TTABLE);
++	lua_getfield(L, 1, "tv_sec");
++	req.tv_sec = (time_t)luaL_optinteger(L, -1, 0);
++	lua_getfield(L, 1, "tv_nsec");
++	req.tv_nsec = (long)luaL_optinteger(L, -1, 0);
++	lua_pop(L, 2);
++	if (nanosleep(&req, &rem) == -1) {
++		push_error(L, errno);
++		push_timespec(L, &rem);
++		return (4);
++	}
++	lua_pushinteger(L, 0);
++	return (1);
++}
++
++static int
++lua_time(lua_State *L)
++{
++	enforce_max_args(L, 0);
++	lua_pushinteger(L, (lua_Integer)time(NULL));
++	return (1);
++}
++
+ #define	REG_DEF(n, func)	{ #n, func }
+ #define REG_SIMPLE(n)		REG_DEF(n, lua_ ## n)
+ static const struct luaL_Reg libgenlib[] = {
+@@ -564,6 +1280,66 @@ static const struct luaL_Reg fnmatchlib[] = {
+ 
+ static const struct luaL_Reg sys_statlib[] = {
+ 	REG_SIMPLE(chmod),
++	REG_SIMPLE(lstat),
++	REG_SIMPLE(mkdir),
++	REG_SIMPLE(stat),
++	REG_SIMPLE(S_ISBLK),
++	REG_SIMPLE(S_ISCHR),
++	REG_SIMPLE(S_ISDIR),
++	REG_SIMPLE(S_ISFIFO),
++	REG_SIMPLE(S_ISLNK),
++	REG_SIMPLE(S_ISREG),
++	REG_SIMPLE(S_ISSOCK),
++	{ NULL, NULL },
++};
++
++static const struct luaL_Reg direntlib[] = {
++	REG_SIMPLE(dir),
++	REG_SIMPLE(files),
++	{ NULL, NULL },
++};
++
++static const struct luaL_Reg errnolib[] = {
++	REG_SIMPLE(errno),
++	{ NULL, NULL },
++};
++
++static const struct luaL_Reg fcntllib[] = {
++	REG_SIMPLE(fcntl),
++	REG_SIMPLE(open),
++	{ NULL, NULL },
++};
++
++static const struct luaL_Reg polllib[] = {
++	REG_SIMPLE(poll),
++	REG_SIMPLE(rpoll),
++	{ NULL, NULL },
++};
++
++static const struct luaL_Reg signallib[] = {
++	REG_SIMPLE(kill),
++	REG_SIMPLE(raise),
++	REG_SIMPLE(signal),
++	{ NULL, NULL },
++};
++
++static const struct luaL_Reg sys_socketlib[] = {
++	REG_SIMPLE(accept),
++	REG_SIMPLE(bind),
++	REG_SIMPLE(connect),
++	REG_SIMPLE(getsockopt),
++	REG_SIMPLE(listen),
++	REG_SIMPLE(recv),
++	REG_SIMPLE(send),
++	REG_SIMPLE(shutdown),
++	REG_SIMPLE(socket),
++	{ NULL, NULL },
++};
++
++static const struct luaL_Reg timelib[] = {
++	REG_SIMPLE(clock_gettime),
++	REG_SIMPLE(nanosleep),
++	REG_SIMPLE(time),
+ 	{ NULL, NULL },
+ };
+ 
+@@ -626,13 +1402,231 @@ luaopen_posix_fnmatch(lua_State *L)
+ 	return 1;
+ }
+ 
++#define	setconst(c) do {		\
++	lua_pushinteger(L, c);		\
++	lua_setfield(L, -2, #c);	\
++} while (0)
++
+ static int
+ luaopen_posix_sys_stat(lua_State *L)
+ {
+ 	luaL_newlib(L, sys_statlib);
++	setconst(S_IFMT);
++	setconst(S_IFBLK);
++	setconst(S_IFCHR);
++	setconst(S_IFDIR);
++	setconst(S_IFIFO);
++	setconst(S_IFLNK);
++	setconst(S_IFREG);
++	setconst(S_IFSOCK);
++	setconst(S_IRWXU);
++	setconst(S_IRUSR);
++	setconst(S_IWUSR);
++	setconst(S_IXUSR);
++	setconst(S_IRWXG);
++	setconst(S_IRGRP);
++	setconst(S_IWGRP);
++	setconst(S_IXGRP);
++	setconst(S_IRWXO);
++	setconst(S_IROTH);
++	setconst(S_IWOTH);
++	setconst(S_IXOTH);
++	setconst(S_ISUID);
++	setconst(S_ISGID);
++	setconst(S_ISVTX);
++	return (1);
++}
++
++static int
++luaopen_posix_dirent(lua_State *L)
++{
++	luaL_newlib(L, direntlib);
++	return (1);
++}
++
++static int
++luaopen_posix_errno(lua_State *L)
++{
++	luaL_newlib(L, errnolib);
++	setconst(E2BIG);
++	setconst(EACCES);
++	setconst(EADDRINUSE);
++	setconst(EADDRNOTAVAIL);
++	setconst(EAFNOSUPPORT);
++	setconst(EAGAIN);
++	setconst(EALREADY);
++	setconst(EBADF);
++	setconst(EBUSY);
++	setconst(ECANCELED);
++	setconst(ECHILD);
++	setconst(ECONNABORTED);
++	setconst(ECONNREFUSED);
++	setconst(ECONNRESET);
++	setconst(EDEADLK);
++	setconst(EDOM);
++	setconst(EEXIST);
++	setconst(EFAULT);
++	setconst(EFBIG);
++	setconst(EHOSTUNREACH);
++	setconst(EINPROGRESS);
++	setconst(EINTR);
++	setconst(EINVAL);
++	setconst(EIO);
++	setconst(EISCONN);
++	setconst(EISDIR);
++	setconst(ELOOP);
++	setconst(EMFILE);
++	setconst(EMLINK);
++	setconst(EMSGSIZE);
++	setconst(ENAMETOOLONG);
++	setconst(ENETDOWN);
++	setconst(ENETUNREACH);
++	setconst(ENFILE);
++	setconst(ENOBUFS);
++	setconst(ENODEV);
++	setconst(ENOENT);
++	setconst(ENOEXEC);
++	setconst(ENOMEM);
++	setconst(ENOPROTOOPT);
++	setconst(ENOSPC);
++	setconst(ENOSYS);
++	setconst(ENOTCONN);
++	setconst(ENOTDIR);
++	setconst(ENOTEMPTY);
++	setconst(ENOTSOCK);
++	setconst(ENOTSUP);
++	setconst(ENOTTY);
++	setconst(ENXIO);
++	setconst(EOPNOTSUPP);
++	setconst(EOVERFLOW);
++	setconst(EPERM);
++	setconst(EPIPE);
++	setconst(ERANGE);
++	setconst(EROFS);
++	setconst(ESPIPE);
++	setconst(ESRCH);
++	setconst(ETIMEDOUT);
++	setconst(ETXTBSY);
++	setconst(EWOULDBLOCK);
++	setconst(EXDEV);
++	return (1);
++}
++
++static int
++luaopen_posix_fcntl(lua_State *L)
++{
++	luaL_newlib(L, fcntllib);
++	setconst(O_RDONLY);
++	setconst(O_WRONLY);
++	setconst(O_RDWR);
++	setconst(O_ACCMODE);
++	setconst(O_APPEND);
++	setconst(O_CLOEXEC);
++	setconst(O_CREAT);
++	setconst(O_DIRECTORY);
++	setconst(O_EXCL);
++	setconst(O_NOCTTY);
++	setconst(O_NOFOLLOW);
++	setconst(O_NONBLOCK);
++	setconst(O_SYNC);
++	setconst(O_TRUNC);
++	setconst(F_DUPFD);
++	setconst(F_DUPFD_CLOEXEC);
++	setconst(F_GETFD);
++	setconst(F_SETFD);
++	setconst(F_GETFL);
++	setconst(F_SETFL);
++	setconst(F_GETOWN);
++	setconst(F_SETOWN);
++	setconst(FD_CLOEXEC);
++	return (1);
++}
++
++static int
++luaopen_posix_poll(lua_State *L)
++{
++	luaL_newlib(L, polllib);
+ 	return (1);
+ }
+ 
++static int
++luaopen_posix_signal(lua_State *L)
++{
++	luaL_newlib(L, signallib);
++	lua_newtable(L);
++	lua_setfield(L, LUA_REGISTRYINDEX, LUA_SIGNAL_HANDLERS);
++	lua_pushlightuserdata(L, (void *)SIG_DFL);
++	lua_setfield(L, -2, "SIG_DFL");
++	lua_pushlightuserdata(L, (void *)SIG_IGN);
++	lua_setfield(L, -2, "SIG_IGN");
++	setconst(SA_NOCLDSTOP);
++	setconst(SA_NODEFER);
++	setconst(SA_RESETHAND);
++	setconst(SA_RESTART);
++	setconst(SIGABRT);
++	setconst(SIGALRM);
++	setconst(SIGBUS);
++	setconst(SIGCHLD);
++	setconst(SIGCONT);
++	setconst(SIGFPE);
++	setconst(SIGHUP);
++	setconst(SIGILL);
++	setconst(SIGINFO);
++	setconst(SIGINT);
++	setconst(SIGKILL);
++	setconst(SIGPIPE);
++	setconst(SIGQUIT);
++	setconst(SIGSEGV);
++	setconst(SIGSTOP);
++	setconst(SIGTERM);
++	setconst(SIGTSTP);
++	setconst(SIGTTIN);
++	setconst(SIGTTOU);
++	setconst(SIGUSR1);
++	setconst(SIGUSR2);
++	setconst(SIGWINCH);
++	return (1);
++}
++
++static int
++luaopen_posix_sys_socket(lua_State *L)
++{
++	luaL_newlib(L, sys_socketlib);
++	setconst(AF_INET);
++	setconst(AF_INET6);
++	setconst(AF_UNIX);
++	setconst(AF_UNSPEC);
++	setconst(SOCK_DGRAM);
++	setconst(SOCK_SEQPACKET);
++	setconst(SOCK_STREAM);
++	setconst(SOCK_CLOEXEC);
++	setconst(SOCK_NONBLOCK);
++	setconst(SOL_SOCKET);
++	setconst(SO_ERROR);
++	setconst(SO_KEEPALIVE);
++	setconst(SO_RCVBUF);
++	setconst(SO_REUSEADDR);
++	setconst(SO_SNDBUF);
++	setconst(SO_TYPE);
++	setconst(SOMAXCONN);
++	setconst(SHUT_RD);
++	setconst(SHUT_RDWR);
++	setconst(SHUT_WR);
++	return (1);
++}
++
++static int
++luaopen_posix_time(lua_State *L)
++{
++	luaL_newlib(L, timelib);
++	setconst(CLOCK_MONOTONIC);
++	setconst(CLOCK_PROCESS_CPUTIME_ID);
++	setconst(CLOCK_REALTIME);
++	setconst(CLOCK_THREAD_CPUTIME_ID);
++	return (1);
++}
++#undef setconst
++
+ static int
+ luaopen_posix_sys_utsname(lua_State *L)
+ {
+@@ -678,16 +1672,36 @@ luaopen_posix(lua_State *L)
+ {
+ 	lua_newtable(L); /* posix */
+ 
++	luaL_requiref(L, "posix.dirent", luaopen_posix_dirent, 0);
++	lua_setfield(L, -2, "dirent");
++
++	luaL_requiref(L, "posix.errno", luaopen_posix_errno, 0);
++	lua_setfield(L, -2, "errno");
++
++	luaL_requiref(L, "posix.fcntl", luaopen_posix_fcntl, 0);
++	lua_setfield(L, -2, "fcntl");
++
+ 	luaL_requiref(L, "posix.fnmatch", luaopen_posix_fnmatch, 0);
+ 	lua_setfield(L, -2, "fnmatch");
+ 
+ 	luaL_requiref(L, "posix.libgen", luaopen_posix_libgen, 0);
+ 	lua_setfield(L, -2, "libgen");
+ 
++	luaL_requiref(L, "posix.poll", luaopen_posix_poll, 0);
++	lua_setfield(L, -2, "poll");
++
++	luaL_requiref(L, "posix.signal", luaopen_posix_signal, 0);
++	lua_setfield(L, -2, "signal");
++
+ 	luaL_requiref(L, "posix.stdlib", luaopen_posix_stdlib, 0);
+ 	lua_setfield(L, -2, "stdlib");
+ 
++	luaL_requiref(L, "posix.time", luaopen_posix_time, 0);
++	lua_setfield(L, -2, "time");
++
+ 	lua_newtable(L); /* posix.sys */
++	luaL_requiref(L, "posix.sys.socket", luaopen_posix_sys_socket, 0);
++	lua_setfield(L, -2, "socket");
+ 	luaL_requiref(L, "posix.sys.stat", luaopen_posix_sys_stat, 0);
+ 	lua_setfield(L, -2, "stat");
+ 	luaL_requiref(L, "posix.sys.utsname", luaopen_posix_sys_utsname, 0);

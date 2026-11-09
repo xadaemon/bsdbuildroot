@@ -30,7 +30,8 @@ next MiB      UFS2 root, soft updates, label sedna_freebsd   (what FreeBSD mount
 | busybox syslogd, `/var/log` in RAM | `syslogd(8)`, `/var/log` on tmpfs                       |
 | hostname `sedna-xxxxxx` from the NIC's MAC (`S01hostname`) | `localhost`; the Linux behaviour with `TARGET_HOSTNAME_FROM_MAC="yes"`, see [Configuration](#configuration) |
 | `S90virtio9p`, `S99mnt_init`       | same scripts, using `p9fs(4)`                           |
-| Lua 5.4                            | `lua` (FreeBSD's `flua`, core library plus `posix`)     |
+| Lua 5.4, luaposix, lua-cjson       | `lua` (FreeBSD's `flua`), its `posix` module extended with the luaposix functions OC2's libraries use (patch 0010), and a `cjson` module |
+| OC2's `devices` library and `oc2busd` (high-level API) | the same, unchanged from `/mnt/builtin`, set up by `S91oc2`, see [High-level API](#high-level-api) |
 | nano                               | `ee`                                                    |
 | mid-level API as `/dev/uioN` (`uio_pdrv_genirq`), `mlapi.h` for tcc | `/dev/mlapi` (patch 0009) with the same interface; `mlapi(1)` to use it from the shell, `mlapi.h` to cross compile, see [Mid-level API](#mid-level-api) |
 
@@ -74,6 +75,18 @@ at the login prompt. The disk is 24 MB: 5 MB boot area, 19 MB root with
    page and its interrupt, with the interface Linux's `uio_pdrv_genirq`
    gives OC2's image: `mmap` the page, `read` 4 bytes to wait for the
    interrupt, `write` a 32-bit 1 to enable it again, plus `poll`.
+10. **flua: the luaposix functions OC2's libraries use**: `posix.fcntl`,
+    `posix.poll`, `posix.time`, `posix.errno`, `posix.signal` (with Lua
+    handlers), `posix.sys.socket` (AF_UNIX), `posix.dirent`, and `stat`/`mkdir`
+    in `posix.sys.stat`, with luaposix's names and calling conventions.
+11. **virtio-console: init and lock devices** (`/dev/ttyV*.init`): a tty
+    goes back to its `.init` settings on every first open, and vtcon ports
+    had none, so they always opened in canonical mode with echo. The HLAPI
+    ports need raw mode for every program that opens them.
+12. **virtio-console: back-pressure**: vtcon gave every receive buffer back
+    to the device at once, so input beyond the tty's ~2 KB queue was
+    dropped. It now holds buffers until the reader makes room, as Linux's
+    driver does, so large HLAPI payloads arrive intact.
 
 The `src` stage commits the patches to a local `sedna` branch, with a fixed
 author and dates, rather than leaving them as changes in the work tree. With
@@ -82,7 +95,11 @@ a clean tree the kernel's version string (`uname -a`) is reproducible: just
 and time that FreeBSD records for modified trees.
 
 The kernel configuration also needs `options KTRACE`: without it, 15.1's
-`subr_syscall.c` does not build.
+`subr_syscall.c` does not build. It also lowers tmpfs's memory reserve from
+4 MB to 512 KB (`TMPFS_PAGES_MINRESERVED`): tmpfs refuses to create files
+while fewer pages are free, and 4 MB is most of what is free on this
+machine, so `/tmp`, `/var/log` and `/run` failed with "No space left on
+device" as soon as a program or two ran.
 
 ### Not supported yet
 
@@ -93,8 +110,11 @@ The kernel configuration also needs `options KTRACE`: without it, 15.1's
   root file system by label (`/dev/ufs/sedna_freebsd`) instead, so don't
   attach two disks with this image at once.
 - OC2's `/mnt/builtin/init.d` scripts are skipped (they are written for the
-  Linux image, e.g. oc2busd); `touch /etc/mnt_init.builtin` runs them anyway.
-  The 9p file system itself is mounted at `/mnt/builtin` as usual.
+  Linux image); `touch /etc/mnt_init.builtin` runs them anyway. The 9p file
+  system itself is mounted at `/mnt/builtin` as usual, and `S91oc2` does
+  what the scripts that matter do: `LUA_PATH`, and starting oc2busd.
+- OC2's `oc2.serial` Lua module (serial interface cards) looks the card up
+  in Linux's `/sys/class/tty`, so it does not work here.
 - The kernel in the boot area can't be updated from FreeBSD; rebuild the
   image instead.
 
@@ -168,6 +188,8 @@ Output in `output/images`:
 | [`board/sedna-riscv64/rootfs-overlay`](board/sedna-riscv64/rootfs-overlay) | `board/sedna-riscv64/rootfs-overlay` |
 | [`board/sedna-riscv64/hostname-from-mac`](board/sedna-riscv64/hostname-from-mac) | its `etc/init.d/S01hostname`, optional here |
 | [`board/sedna-riscv64/mlapi`](board/sedna-riscv64/mlapi) | (OC2's `include/mlapi.h`, and `mlapi(1)`) |
+| [`rootfs-overlay/etc/rc.d/S91oc2`](board/sedna-riscv64/rootfs-overlay/etc/rc.d/S91oc2) | (OC2's `init.d/S20export_lua_path` and `S25oc2busd`) |
+| [`rootfs-overlay/usr/share/flua/cjson.lua`](board/sedna-riscv64/rootfs-overlay/usr/share/flua/cjson.lua) | (the `lua-cjson` package) |
 | [`board/sedna-riscv64/post-build.sh`](board/sedna-riscv64/post-build.sh) | `board/sedna-riscv64/post-build.sh` |
 | [`scripts/build.sh`](scripts/build.sh) | buildroot's `make` |
 | [`datapack`](datapack) | (the OC2 data pack around the image) |
@@ -195,6 +217,35 @@ OC2 copies the image onto a drive the first time the drive is used, so after
 updating the data pack take a fresh drive from the creative tab.
 
 Made for OpenComputers II 0.11.0 on Minecraft 1.21.1 (NeoForge).
+
+### High-level API
+
+OC2's [high-level API](https://fnuecke.github.io/oc2/manual/en_us/hlapi.html)
+works as in the manual, with OC2's own Lua libraries from `/mnt/builtin`,
+unchanged:
+
+```sh
+lsdev.lua                                   # devices and their type names
+redstone.lua up 15                          # OC2's example script
+lua -e 'd = require("devices"); r = d:find("redstone"); print(r)'
+lua -e 'r = require("devices"):find("redstone"); r:setRedstoneOutput("up", 15)'
+```
+
+`S91oc2` sets it up at boot, after `/mnt/builtin` is mounted:
+
+- The protocol's virtio ports (`oc2.rpc.0`, `oc2.blob.0`, `oc2.event.0`)
+  are made raw (their `.init` devices, patch 0011) and listed in
+  `/sys/class/virtio-ports`, where OC2's library looks them up as on Linux.
+- `LUA_PATH` (`/etc/profile.d/lua_path.sh`) includes `/mnt/builtin/lib/lua`.
+- `oc2busd`, which shares the ports between programs, runs under
+  `daemon(8)`: restarted if it stops, output in `/var/log/messages`. Boot
+  waits until it listens on `/run/oc2/bus`. It takes about 2.5 MB of
+  memory; `touch /etc/oc2busd.disabled` to not start it, then one program
+  at a time opens the ports itself.
+
+While oc2busd runs, don't open the ports from another program (e.g. with
+`OC2_BUS_SOCKET=none`): Linux refuses a second open with `EBUSY`, FreeBSD
+lets it happen, and the two programs would read each other's replies.
 
 ### Mid-level API
 
@@ -235,7 +286,12 @@ the 3-port RPC virtio console, a `builtin` 9p file system, whose contents
 `--builtin DIR` sets), and an emulated mid-level API with a `SYSTEM` device
 and a redstone interface (`REDSTN`, labelled `door`). In scripted runs, a
 `--send "@redstone SIDE LEVEL"` changes the signal the redstone interface
-receives, to test events. Pass them with `ARGS="--oc2 --builtin DIR"`.
+receives, to test events. The RPC console answers the high-level API for the
+same redstone interface (`redstone`, `door`) and a `test` device (`echo` returns
+a binary payload, `fail` fails); `SEDNARUN_HLAPI_DEBUG=1` logs the messages.
+Point `--builtin` at OC2's scripts (`common/src/main/scripts` in its
+sources; the files in `bin` need to be executable) to run its libraries.
+Pass them with `ARGS="--oc2 --builtin DIR"`.
 `FIRMWARE=` boots with another sedna-fw, e.g. the one in the OC2 jar, which is
 what runs in game:
 

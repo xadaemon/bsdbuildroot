@@ -244,8 +244,8 @@ stage_rootfs() {
 	t="$TARGET_DIR"
 	# tar keeps hard links between the files it copies (test and [, ...).
 	(cd "$WORLD" && tar -cf - -T "$files") | (cd "$t" && tar -xpf -)
-	for d in boot dev etc/rc.d etc/profile.d mnt root tmp usr/share/misc \
-	    var/db var/empty var/log var/run var/tmp; do
+	for d in boot dev etc/rc.d etc/profile.d mnt root run sys tmp \
+	    usr/share/misc var/db var/empty var/log var/run var/tmp; do
 		mkdir -p "$t/$d"
 	done
 
