@@ -272,6 +272,15 @@ stage_rootfs() {
 	esac
 	printf '%s\n' "$TARGET_ISSUE" > "$t/etc/issue"
 
+	# mlapi(1), OC2's mid-level API from the shell, against the world just
+	# installed. The host's clang cross compiles.
+	msg "Building mlapi(1)"
+	need cc
+	release=$(awk -F'"' '/^REVISION=/ { print $2 }' "$SRC/sys/conf/newvers.sh")
+	cc --target="$TARGET_ARCH-unknown-freebsd$release" --sysroot="$WORLD" \
+	    -fuse-ld=lld -O2 -Wall -Wextra -Werror -s \
+	    -o "$t/usr/bin/mlapi" "$TOP/$BOARD_DIR/mlapi/mlapi.c"
+
 	if [ -n "$ROOTFS_POST_BUILD_SCRIPT" ]; then
 		msg "Running $ROOTFS_POST_BUILD_SCRIPT"
 		sh "$TOP/$ROOTFS_POST_BUILD_SCRIPT" "$t"

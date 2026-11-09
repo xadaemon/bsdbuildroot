@@ -85,3 +85,6 @@ device		virtio_p9fs
 device		goldfish_rtc
 
 device		sedna_syscon
+
+# OpenComputers II's mid-level API, as /dev/mlapi (patch 0009).
+device		oc2_mlapi

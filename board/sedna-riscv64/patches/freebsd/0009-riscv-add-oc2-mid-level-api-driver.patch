@@ -1,0 +1,359 @@
+riscv: add a driver for the OpenComputers II mid-level API
+
+OC2 computers expose their mid-level API ("oc2,mlapi") as a page of
+byte-wide registers that programs drive directly, plus an interrupt that
+is raised while events are queued. OC2's Linux image binds the generic
+uio_pdrv_genirq driver to it.
+
+Provide the same interface as /dev/mlapi: mmap(2) maps the register page,
+read(2) of 4 bytes blocks until the interrupt fired and returns how many
+times it has fired, write(2) of a 32-bit 1 re-enables the interrupt (it is
+disabled each time it fires), and poll(2) reports when a read would not
+block.
+
+diff --git a/sys/conf/files.riscv b/sys/conf/files.riscv
+index fdbc25073..732454271 100644
+--- a/sys/conf/files.riscv
++++ b/sys/conf/files.riscv
+@@ -76,6 +76,7 @@ riscv/riscv/ptrace_machdep.c	standard
+ riscv/riscv/riscv_console.c	optional	rcons
+ riscv/riscv/riscv_syscon.c	optional	syscon riscv_syscon fdt
+ riscv/sedna/sedna_syscon.c	optional	sedna_syscon fdt
++riscv/sedna/oc2_mlapi.c		optional	oc2_mlapi fdt
+ riscv/riscv/sigtramp.S		standard
+ riscv/riscv/sbi.c		standard
+ riscv/riscv/sbi_ipi.c		optional	smp
+diff --git a/sys/riscv/sedna/oc2_mlapi.c b/sys/riscv/sedna/oc2_mlapi.c
+new file mode 100644
+index 000000000..fd12f0cec
+--- /dev/null
++++ b/sys/riscv/sedna/oc2_mlapi.c
+@@ -0,0 +1,328 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Matheus Xavier
++ *
++ * OpenComputers II mid-level API.
++ *
++ * OC2 computers have a page of byte-wide registers ("oc2,mlapi") through which
++ * programs call functions of the devices on the computer's bus, and an
++ * interrupt that is raised while events are queued. Programs drive the
++ * registers themselves; this driver only gives them access, as /dev/mlapi:
++ *
++ *   mmap(2)   the register page, 4096 bytes at offset 0.
++ *   read(2)   4 bytes: blocks until the interrupt fired since the last read
++ *             on this descriptor, returns the number of times it fired.
++ *   write(2)  4 bytes: a non-zero value enables the interrupt, 0 disables it.
++ *   poll(2)   readable when a read would not block.
++ *
++ * This is how Linux's uio_pdrv_genirq presents the page as /dev/uioN, which
++ * OC2's Linux image uses: the interrupt is disabled each time it fires, until
++ * a 1 is written. Programs read all queued events before writing the 1. If
++ * events are still queued then, the interrupt fires again right away.
++ *
++ * The interrupt is masked in software: the device only raises it when its
++ * state changes, so while it is disabled the handler ignores it, and
++ * enabling it checks whether it would be raised now.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/conf.h>
++#include <sys/fcntl.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++#include <sys/poll.h>
++#include <sys/proc.h>
++#include <sys/rman.h>
++#include <sys/selinfo.h>
++#include <sys/uio.h>
++
++#include <vm/vm.h>
++
++#include <machine/bus.h>
++
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++
++#define	OC2_MLAPI_OCEVC		0x04	/* event control and status */
++#define	 OC2_MLAPI_OCEVI	0x02	/* raise the interrupt while queued */
++#define	 OC2_MLAPI_OCEVP	0x80	/* an event is queued */
++
++static MALLOC_DEFINE(M_OC2_MLAPI, "oc2_mlapi", "OC2 mid-level API");
++
++struct oc2_mlapi_softc {
++	device_t		dev;
++	struct resource		*res[2];
++	void			*intrhand;
++	struct cdev		*cdev;
++	struct mtx		mtx;
++	struct selinfo		rsel;
++	bool			enabled;	/* the interrupt is enabled */
++	uint32_t		count;		/* times it fired */
++};
++
++/* Per open file. */
++struct oc2_mlapi_file {
++	struct oc2_mlapi_softc	*sc;
++	uint32_t		seen;		/* count at the last read */
++};
++
++static struct resource_spec oc2_mlapi_spec[] = {
++	{ SYS_RES_MEMORY,	0,	RF_ACTIVE },
++	{ SYS_RES_IRQ,		0,	RF_ACTIVE | RF_OPTIONAL },
++	RESOURCE_SPEC_END
++};
++
++static struct ofw_compat_data compat_data[] = {
++	{ "oc2,mlapi",		1 },
++	{ NULL,			0 }
++};
++
++static d_open_t		oc2_mlapi_open;
++static d_read_t		oc2_mlapi_read;
++static d_write_t	oc2_mlapi_write;
++static d_poll_t		oc2_mlapi_poll;
++static d_mmap_t		oc2_mlapi_mmap;
++
++static struct cdevsw oc2_mlapi_cdevsw = {
++	.d_version =	D_VERSION,
++	.d_name =	"mlapi",
++	.d_open =	oc2_mlapi_open,
++	.d_read =	oc2_mlapi_read,
++	.d_write =	oc2_mlapi_write,
++	.d_poll =	oc2_mlapi_poll,
++	.d_mmap =	oc2_mlapi_mmap,
++};
++
++/* Called with the lock held. */
++static void
++oc2_mlapi_fire(struct oc2_mlapi_softc *sc)
++{
++	sc->enabled = false;
++	sc->count++;
++	wakeup(&sc->count);
++	selwakeup(&sc->rsel);
++}
++
++static void
++oc2_mlapi_intr(void *arg)
++{
++	struct oc2_mlapi_softc *sc = arg;
++
++	mtx_lock(&sc->mtx);
++	if (sc->enabled)
++		oc2_mlapi_fire(sc);
++	mtx_unlock(&sc->mtx);
++}
++
++static void
++oc2_mlapi_file_free(void *data)
++{
++	free(data, M_OC2_MLAPI);
++}
++
++static int
++oc2_mlapi_open(struct cdev *cdev, int oflags, int devtype, struct thread *td)
++{
++	struct oc2_mlapi_softc *sc = cdev->si_drv1;
++	struct oc2_mlapi_file *f;
++	int error;
++
++	f = malloc(sizeof(*f), M_OC2_MLAPI, M_WAITOK | M_ZERO);
++	f->sc = sc;
++	mtx_lock(&sc->mtx);
++	f->seen = sc->count;
++	mtx_unlock(&sc->mtx);
++	error = devfs_set_cdevpriv(f, oc2_mlapi_file_free);
++	if (error != 0)
++		free(f, M_OC2_MLAPI);
++	return (error);
++}
++
++static int
++oc2_mlapi_read(struct cdev *cdev, struct uio *uio, int ioflag)
++{
++	struct oc2_mlapi_softc *sc = cdev->si_drv1;
++	struct oc2_mlapi_file *f;
++	uint32_t count;
++	int error;
++
++	if (uio->uio_resid != sizeof(count))
++		return (EINVAL);
++	if (sc->intrhand == NULL)
++		return (ENXIO);
++	error = devfs_get_cdevpriv((void **)&f);
++	if (error != 0)
++		return (error);
++
++	mtx_lock(&sc->mtx);
++	while (sc->count == f->seen) {
++		if ((ioflag & O_NONBLOCK) != 0) {
++			mtx_unlock(&sc->mtx);
++			return (EAGAIN);
++		}
++		error = msleep(&sc->count, &sc->mtx, PCATCH, "mlapi", 0);
++		if (error != 0) {
++			mtx_unlock(&sc->mtx);
++			return (error);
++		}
++	}
++	count = f->seen = sc->count;
++	mtx_unlock(&sc->mtx);
++
++	return (uiomove(&count, sizeof(count), uio));
++}
++
++static int
++oc2_mlapi_write(struct cdev *cdev, struct uio *uio, int ioflag)
++{
++	struct oc2_mlapi_softc *sc = cdev->si_drv1;
++	int32_t value;
++	uint8_t evc;
++	int error;
++
++	if (uio->uio_resid != sizeof(value))
++		return (EINVAL);
++	if (sc->intrhand == NULL)
++		return (ENXIO);
++	error = uiomove(&value, sizeof(value), uio);
++	if (error != 0)
++		return (error);
++
++	mtx_lock(&sc->mtx);
++	if (value == 0) {
++		sc->enabled = false;
++	} else if (!sc->enabled) {
++		/* As if it were masked: fire now if it is being raised. */
++		evc = bus_read_1(sc->res[0], OC2_MLAPI_OCEVC);
++		if ((evc & (OC2_MLAPI_OCEVI | OC2_MLAPI_OCEVP)) ==
++		    (OC2_MLAPI_OCEVI | OC2_MLAPI_OCEVP))
++			oc2_mlapi_fire(sc);
++		else
++			sc->enabled = true;
++	}
++	mtx_unlock(&sc->mtx);
++	return (0);
++}
++
++static int
++oc2_mlapi_poll(struct cdev *cdev, int events, struct thread *td)
++{
++	struct oc2_mlapi_softc *sc = cdev->si_drv1;
++	struct oc2_mlapi_file *f;
++	int revents;
++
++	if (devfs_get_cdevpriv((void **)&f) != 0)
++		return (events & (POLLHUP | POLLIN | POLLRDNORM));
++
++	revents = 0;
++	mtx_lock(&sc->mtx);
++	if ((events & (POLLIN | POLLRDNORM)) != 0) {
++		if (sc->count != f->seen)
++			revents |= events & (POLLIN | POLLRDNORM);
++		else
++			selrecord(td, &sc->rsel);
++	}
++	mtx_unlock(&sc->mtx);
++	return (revents);
++}
++
++static int
++oc2_mlapi_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
++    int nprot, vm_memattr_t *memattr)
++{
++	struct oc2_mlapi_softc *sc = cdev->si_drv1;
++
++	if (offset < 0 || offset >= rman_get_size(sc->res[0]))
++		return (EINVAL);
++	*paddr = rman_get_start(sc->res[0]) + offset;
++	*memattr = VM_MEMATTR_DEVICE;
++	return (0);
++}
++
++static int
++oc2_mlapi_probe(device_t dev)
++{
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
++		return (ENXIO);
++
++	device_set_desc(dev, "OpenComputers II mid-level API");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++oc2_mlapi_attach(device_t dev)
++{
++	struct oc2_mlapi_softc *sc;
++	struct make_dev_args args;
++	int error;
++
++	sc = device_get_softc(dev);
++	sc->dev = dev;
++
++	if (bus_alloc_resources(dev, oc2_mlapi_spec, sc->res) != 0) {
++		device_printf(dev, "cannot allocate resources\n");
++		return (ENXIO);
++	}
++	if (rman_get_size(sc->res[0]) < PAGE_SIZE ||
++	    (rman_get_start(sc->res[0]) & PAGE_MASK) != 0) {
++		device_printf(dev, "registers are not a whole page\n");
++		bus_release_resources(dev, oc2_mlapi_spec, sc->res);
++		return (ENXIO);
++	}
++
++	mtx_init(&sc->mtx, device_get_nameunit(dev), NULL, MTX_DEF);
++
++	if (sc->res[1] == NULL) {
++		device_printf(dev, "no interrupt, events cannot be waited "
++		    "for\n");
++	} else {
++		error = bus_setup_intr(dev, sc->res[1],
++		    INTR_TYPE_MISC | INTR_MPSAFE, NULL, oc2_mlapi_intr, sc,
++		    &sc->intrhand);
++		if (error != 0) {
++			device_printf(dev, "cannot set up interrupt, events "
++			    "cannot be waited for\n");
++			sc->intrhand = NULL;
++		}
++	}
++
++	make_dev_args_init(&args);
++	args.mda_devsw = &oc2_mlapi_cdevsw;
++	args.mda_uid = UID_ROOT;
++	args.mda_gid = GID_WHEEL;
++	args.mda_mode = 0600;
++	args.mda_si_drv1 = sc;
++	error = make_dev_s(&args, &sc->cdev, "mlapi");
++	if (error != 0) {
++		device_printf(dev, "cannot create /dev/mlapi\n");
++		if (sc->intrhand != NULL)
++			bus_teardown_intr(dev, sc->res[1], sc->intrhand);
++		mtx_destroy(&sc->mtx);
++		bus_release_resources(dev, oc2_mlapi_spec, sc->res);
++		return (error);
++	}
++
++	return (0);
++}
++
++static device_method_t oc2_mlapi_methods[] = {
++	DEVMETHOD(device_probe,		oc2_mlapi_probe),
++	DEVMETHOD(device_attach,	oc2_mlapi_attach),
++	DEVMETHOD_END
++};
++
++static driver_t oc2_mlapi_driver = {
++	"oc2_mlapi",
++	oc2_mlapi_methods,
++	sizeof(struct oc2_mlapi_softc)
++};
++
++DRIVER_MODULE(oc2_mlapi, simplebus, oc2_mlapi_driver, 0, 0);

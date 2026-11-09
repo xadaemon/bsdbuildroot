@@ -32,10 +32,11 @@ next MiB      UFS2 root, soft updates, label sedna_freebsd   (what FreeBSD mount
 | `S90virtio9p`, `S99mnt_init`       | same scripts, using `p9fs(4)`                           |
 | Lua 5.4                            | `lua` (FreeBSD's `flua`, core library plus `posix`)     |
 | nano                               | `ee`                                                    |
+| mid-level API as `/dev/uioN` (`uio_pdrv_genirq`), `mlapi.h` for tcc | `/dev/mlapi` (patch 0009) with the same interface; `mlapi(1)` to use it from the shell, `mlapi.h` to cross compile, see [Mid-level API](#mid-level-api) |
 
 Kernel ([`board/sedna-riscv64/kernel/SEDNA`](board/sedna-riscv64/kernel/SEDNA)):
 one hart, no modules, ns16550 console, virtio-mmio block/net/console/9p,
-Goldfish RTC, PLIC, SBI timer, UFS root mounted by label, ext2fs, tmpfs, DDB.
+Goldfish RTC, PLIC, SBI timer, OC2's mid-level API, UFS root mounted by label, ext2fs, tmpfs, DDB.
 
 It runs in OC2's largest configuration, 4 × 8 MB memory: about 25 MB usable
 (`hw.physmem`) after the firmware's 2 MB and the kernel, ~6 MB of it free
@@ -69,6 +70,10 @@ at the login prompt. The disk is 24 MB: 5 MB boot area, 19 MB root with
 8. **virtio-p9fs: finalize feature negotiation**: unlike every other virtio
    driver, p9fs never set `FEATURES_OK`; Sedna's (modern) 9p device then
    never answers, and mounting `/mnt/builtin` hung for 120 seconds.
+9. **OC2 mid-level API driver** (`oc2,mlapi`): `/dev/mlapi`, the register
+   page and its interrupt, with the interface Linux's `uio_pdrv_genirq`
+   gives OC2's image: `mmap` the page, `read` 4 bytes to wait for the
+   interrupt, `write` a 32-bit 1 to enable it again, plus `poll`.
 
 The `src` stage commits the patches to a local `sedna` branch, with a fixed
 author and dates, rather than leaving them as changes in the work tree. With
@@ -162,6 +167,7 @@ Output in `output/images`:
 | [`board/sedna-riscv64/patches/freebsd`](board/sedna-riscv64/patches/freebsd) | `board/sedna-riscv64/patches/linux` |
 | [`board/sedna-riscv64/rootfs-overlay`](board/sedna-riscv64/rootfs-overlay) | `board/sedna-riscv64/rootfs-overlay` |
 | [`board/sedna-riscv64/hostname-from-mac`](board/sedna-riscv64/hostname-from-mac) | its `etc/init.d/S01hostname`, optional here |
+| [`board/sedna-riscv64/mlapi`](board/sedna-riscv64/mlapi) | (OC2's `include/mlapi.h`, and `mlapi(1)`) |
 | [`board/sedna-riscv64/post-build.sh`](board/sedna-riscv64/post-build.sh) | `board/sedna-riscv64/post-build.sh` |
 | [`scripts/build.sh`](scripts/build.sh) | buildroot's `make` |
 | [`datapack`](datapack) | (the OC2 data pack around the image) |
@@ -190,6 +196,29 @@ updating the data pack take a fresh drive from the creative tab.
 
 Made for OpenComputers II 0.11.0 on Minecraft 1.21.1 (NeoForge).
 
+### Mid-level API
+
+OC2's [mid-level API](https://github.com/fnuecke/oc2/blob/1.21.1/docs/mlapi.md#risc-v)
+is `/dev/mlapi` (root only, as on Linux). The image has no C compiler, so
+`mlapi(1)` wraps it for the shell and Lua (`os.execute`, `io.popen`):
+
+```sh
+mlapi list                    # index, device name, labels
+mlapi find REDSTN door        # index of the first device with all these names
+mlapi call door 3 1 15        # REDSTN setRedstoneOutput: side 1 (up), level 15
+mlapi call REDSTN 1 1         # getRedstoneInput, side 1: prints the level
+mlapi call -t SYSTEM 1 1 0    # getItemName of item 1, as text
+mlapi call SYSTEM 2 s:stone   # s:TEXT passes text as argument bytes
+mlapi events -n 1             # wait (interrupt, no polling) for an event:
+                              # prints DEVICE CODE VALUE
+```
+
+Function codes and byte layouts are in OC2's device reference. Programs
+written against OC2's `mlapi.h` (its `/mnt/builtin/example/*.c`) build
+unchanged with [`board/sedna-riscv64/mlapi/mlapi.h`](board/sedna-riscv64/mlapi/mlapi.h),
+the same library opening `/dev/mlapi`. Cross compile them on the build host
+like `mlapi(1)` is, see `stage_rootfs` in [`scripts/build.sh`](scripts/build.sh).
+
 ## Testing
 
 [`test/`](test) boots the images on Sedna itself, locally (needs a JDK; Sedna
@@ -203,7 +232,10 @@ make -C test smoke      # scripted boot, a few commands, host-requested poweroff
 The runner sets the board up like OC2: 4 × 8 MB memory, OC2's bootargs, and
 `--oc2` adds OC2's built-in devices on OC2's interrupts (two Goldfish RTCs,
 the 3-port RPC virtio console, a `builtin` 9p file system, whose contents
-`--builtin DIR` sets). Pass them with `ARGS="--oc2 --builtin DIR"`.
+`--builtin DIR` sets), and an emulated mid-level API with a `SYSTEM` device
+and a redstone interface (`REDSTN`, labelled `door`). In scripted runs, a
+`--send "@redstone SIDE LEVEL"` changes the signal the redstone interface
+receives, to test events. Pass them with `ARGS="--oc2 --builtin DIR"`.
 `FIRMWARE=` boots with another sedna-fw, e.g. the one in the OC2 jar, which is
 what runs in game:
 
