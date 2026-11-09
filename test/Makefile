@@ -39,6 +39,7 @@ disk:
 
 smoke: $(STAMP) disk
 	$(RUN) --timeout 900 --poweroff-after 5 \
+	    --wait-for 'login: ' --send 'root\n' --wait-for '# ' \
 	    --send 'uname -a; df -h /; mount; ifconfig -a | grep -E "^[a-z]"; sysctl hw.physmem\n' \
 	    --send 'echo "print(_VERSION)" | lua; ls /mnt; uptime\n' \
 	    $(ARGS)
