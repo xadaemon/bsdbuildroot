@@ -1,0 +1,20 @@
+# System-wide profile for sh(1) login shells.
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+if [ "$(id -u)" -eq 0 ]; then
+	PS1='\u@\h:\w# '
+else
+	PS1='\u@\h:\w$ '
+fi
+export PS1
+
+EDITOR=ee
+PAGER=less
+export EDITOR PAGER
+
+for f in /etc/profile.d/*.sh; do
+	[ -r "$f" ] && . "$f"
+done
+unset f

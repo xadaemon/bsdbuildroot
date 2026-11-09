@@ -1,0 +1,56 @@
+riscv: add a Linux boot image header
+
+Put the RISC-V Linux "Image" header in the first 64 bytes of the kernel,
+with a jump to _alt_start as its first instruction. A flat binary of the
+kernel (objcopy -O binary) can then be booted by firmware and boot loaders
+that only understand the Linux format, such as the Sedna board firmware
+(sedna-fw) or U-Boot's booti. Firmware that jumps to the load address
+without parsing the header, like OpenSBI fw_jump, keeps working.
+
+text_offset is 2MB: locore maps the kernel with 2MB superpages, so it must
+be loaded at a 2MB aligned address.
+
+diff --git a/sys/riscv/riscv/locore.S b/sys/riscv/riscv/locore.S
+index 305ed8d79f10..2a3a2c459bf3 100644
+--- a/sys/riscv/riscv/locore.S
++++ b/sys/riscv/riscv/locore.S
+@@ -52,9 +52,38 @@
+ 	.set	kernbase, KERNBASE
+ 
+ 	.text
++/*
++ * RISC-V Linux boot image header (Documentation/arch/riscv/boot-image-header.rst
++ * in Linux). It occupies the first 64 bytes of the kernel, so a flat binary of
++ * the kernel (objcopy -O binary) can be booted by firmware and boot loaders
++ * that only understand the Linux "Image" format. Entering at the start of the
++ * image jumps straight to _alt_start, so firmware that just jumps to the load
++ * address without parsing the header (e.g. OpenSBI fw_jump) keeps working.
++ *
++ * The kernel must be loaded at a 2MB aligned physical address, see the
++ * superpage mappings built in pagetables below; text_offset says so.
++ */
++	.globl	linux_image_header
++linux_image_header:
++.option push
++.option norvc
++	j	_alt_start			/* code0: must be 4 bytes */
++.option pop
++	.word	0				/* code1 */
++	.quad	0x200000			/* text_offset from start of RAM */
++	.quad	_end - KERNBASE			/* image_size, including bss */
++	.quad	0				/* flags: little endian */
++	.word	0x2				/* version 0.2 */
++	.word	0				/* res1 */
++	.quad	0				/* res2 */
++	.ascii	"RISCV\0\0\0"			/* magic (deprecated) */
++	.ascii	"RSC\x05"			/* magic2 */
++	.word	0				/* res3 */
++
+ /*
+  * Alternate entry point. Used when booting via SBI firmware. It must be placed
+- * at the beginning of the .text section. Arguments are as follows:
++ * right after the Linux image header, at the beginning of the .text section.
++ * Arguments are as follows:
+  *  - a0 = hart ID
+  *  - a1 = dtbp
+  *

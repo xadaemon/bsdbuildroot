@@ -1,0 +1,45 @@
+#!/bin/sh
+#
+# Mounts the host file systems Sedna exports over virtio 9p at /mnt/<tag>, and
+# adds their bin directory to PATH. Same as the Linux image's S90virtio9p.
+#
+
+INIT_PREFIX="/etc/profile.d"
+
+tags() {
+	for oid in $(sysctl -N dev 2>/dev/null | grep '\.p9fs_mount_tag$'); do
+		sysctl -n "$oid"
+	done
+}
+
+start() {
+	printf 'Mounting virtual file systems: '
+	for tag in $(tags); do
+		mkdir -p "/mnt/$tag"
+		mount -t p9fs "$tag" "/mnt/$tag"
+
+		init_tag="$INIT_PREFIX/01_init_tag_$tag.sh"
+		if [ ! -f "$init_tag" ]; then
+			echo 'export PATH="$PATH:'"/mnt/$tag/bin"'"' > "$init_tag"
+		fi
+	done
+	printf 'OK\n'
+}
+
+stop() {
+	printf 'Unmounting virtual file systems: '
+	for tag in $(tags); do
+		umount "/mnt/$tag" 2>/dev/null
+	done
+	printf 'OK\n'
+}
+
+case "$1" in
+	start|stop)
+		"$1" ;;
+	restart|reload)
+		stop; sleep 1; start ;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1 ;;
+esac

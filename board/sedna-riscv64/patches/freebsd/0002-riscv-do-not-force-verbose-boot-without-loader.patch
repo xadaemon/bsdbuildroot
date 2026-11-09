@@ -1,0 +1,25 @@
+riscv: do not force a verbose boot without loader(8)
+
+fake_preload_metadata() set RB_VERBOSE, so every boot without loader(8)
+was verbose. Boot quietly instead; -v in /chosen/bootargs still enables
+verbose booting.
+
+diff --git a/sys/riscv/riscv/machdep.c b/sys/riscv/riscv/machdep.c
+index 366cf1d5703f..c3a0c8df5e3b 100644
+--- a/sys/riscv/riscv/machdep.c
++++ b/sys/riscv/riscv/machdep.c
+@@ -389,9 +389,13 @@ fake_preload_metadata(struct riscv_bootparams *rvbp)
+ 	PRELOAD_PUSH_VALUE(uint32_t, sizeof(vm_offset_t));
+ 	PRELOAD_PUSH_VALUE(vm_offset_t, lastaddr);
+ 
++	/*
++	 * Boot quietly. A verbose boot can still be requested by passing -v in
++	 * /chosen/bootargs, see parse_fdt_bootargs().
++	 */
+ 	PRELOAD_PUSH_VALUE(uint32_t, MODINFO_METADATA | MODINFOMD_HOWTO);
+ 	PRELOAD_PUSH_VALUE(uint32_t, sizeof(int));
+-	PRELOAD_PUSH_VALUE(int, RB_VERBOSE);
++	PRELOAD_PUSH_VALUE(int, 0);
+ 
+ 	/* End marker */
+ 	PRELOAD_PUSH_VALUE(uint32_t, 0);

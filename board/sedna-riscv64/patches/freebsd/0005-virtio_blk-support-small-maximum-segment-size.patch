@@ -1,0 +1,53 @@
+virtio_blk: support a maximum segment size below maxphys
+
+vtblk refused to attach when the device's maximum segment size
+(VIRTIO_BLK_F_SIZE_MAX) is smaller than maxphys, because sglist(9)
+coalesces adjacent segments. Sedna advertises 16KB. Limit the transfer
+size to the maximum segment size instead, so no segment can exceed it.
+
+diff --git a/sys/dev/virtio/block/virtio_blk.c b/sys/dev/virtio/block/virtio_blk.c
+index 5eb681128e9c..2de8006000fb 100644
+--- a/sys/dev/virtio/block/virtio_blk.c
++++ b/sys/dev/virtio/block/virtio_blk.c
+@@ -101,6 +101,7 @@ struct vtblk_softc {
+ 	struct vtblk_request	*vtblk_req_ordered;
+ 
+ 	int			 vtblk_max_nsegs;
++	uint32_t		 vtblk_size_max;
+ 	int			 vtblk_request_count;
+ 	enum vtblk_cache_mode	 vtblk_write_cache;
+ 
+@@ -340,16 +341,20 @@ vtblk_attach(device_t dev)
+ 	/*
+ 	 * With the current sglist(9) implementation, it is not easy
+ 	 * for us to support a maximum segment size as adjacent
+-	 * segments are coalesced. For now, just make sure it's larger
+-	 * than the maximum supported transfer size.
++	 * segments are coalesced. If it is smaller than the maximum
++	 * transfer size, limit transfers to the maximum segment size
++	 * instead, so no segment can be larger, see vtblk_create_disk().
+ 	 */
++	sc->vtblk_size_max = 0;
+ 	if (virtio_with_feature(dev, VIRTIO_BLK_F_SIZE_MAX)) {
+-		if (blkcfg.size_max < maxphys) {
++		if (blkcfg.size_max < PAGE_SIZE) {
+ 			error = ENOTSUP;
+ 			device_printf(dev, "host requires unsupported "
+-			    "maximum segment size feature\n");
++			    "maximum segment size %u\n", blkcfg.size_max);
+ 			goto fail;
+ 		}
++		if (blkcfg.size_max < maxphys)
++			sc->vtblk_size_max = blkcfg.size_max;
+ 	}
+ 
+ 	sc->vtblk_max_nsegs = vtblk_maximum_segments(sc, &blkcfg);
+@@ -796,6 +801,8 @@ vtblk_alloc_disk(struct vtblk_softc *sc, struct virtio_blk_config *blkcfg)
+ 	    PAGE_SIZE;
+ 	if ((sc->vtblk_flags & VTBLK_FLAG_BUSDMA_ALIGN) == 0)
+ 		dp->d_maxsize -= PAGE_SIZE;
++	if (sc->vtblk_size_max != 0 && dp->d_maxsize > sc->vtblk_size_max)
++		dp->d_maxsize = rounddown2(sc->vtblk_size_max, PAGE_SIZE);
+ 
+ 	if (virtio_with_feature(dev, VIRTIO_BLK_F_GEOMETRY)) {
+ 		dp->d_fwsectors = blkcfg->geometry.sectors;

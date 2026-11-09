@@ -1,0 +1,38 @@
+#!/bin/sh
+#
+# Runs the init scripts in mounted file systems, /mnt/*/init.d/S??*. This
+# allows adding init scripts later on without rebuilding the root file system.
+#
+# OpenComputers II's /mnt/builtin/init.d is written for its Linux image (the
+# oc2busd daemon, Linux device paths), so it is skipped unless
+# /etc/mnt_init.builtin exists.
+#
+
+run() {
+	for i in "$@"; do
+		# Ignore dangling symlinks (if any).
+		[ ! -f "$i" ] && continue
+		case "$i" in
+		/mnt/builtin/*) [ -e /etc/mnt_init.builtin ] || continue ;;
+		esac
+		case "$i" in
+		*.sh)
+			(trap - INT QUIT TSTP; set "$action"; . "$i")
+			;;
+		*)
+			"$i" "$action"
+			;;
+		esac
+	done
+}
+
+action="$1"
+case "$action" in
+	start)
+		run /mnt/*/init.d/S??* ;;
+	stop)
+		run $(ls -r /mnt/*/init.d/S??* 2>/dev/null) ;;
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1 ;;
+esac

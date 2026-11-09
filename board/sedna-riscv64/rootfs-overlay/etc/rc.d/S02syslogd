@@ -1,0 +1,16 @@
+#!/bin/sh
+# System log daemon, local only (-ss: no network sockets).
+
+case "$1" in
+	start)
+		printf 'Starting syslogd: '
+		syslogd -ss && echo OK
+		;;
+	stop)
+		[ -f /var/run/syslog.pid ] && kill "$(cat /var/run/syslog.pid)"
+		;;
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac

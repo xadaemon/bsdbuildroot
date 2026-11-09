@@ -1,0 +1,49 @@
+uart: ns8250: allow giving the FIFO size instead of measuring it
+
+ns8250_bus_probe() measures the FIFO by sending characters in loopback
+mode. UARTs without loopback mode, such as Sedna's emulated 16550A, put
+them on the wire: a few hundred NULs on the console at boot.
+
+If the hw.uart.ns8250_fifo_size tunable is set, use that size and skip
+the measurement.
+
+diff --git a/sys/dev/uart/uart_dev_ns8250.c b/sys/dev/uart/uart_dev_ns8250.c
+index c38d50e54ad8..149e85dfaef1 100644
+--- a/sys/dev/uart/uart_dev_ns8250.c
++++ b/sys/dev/uart/uart_dev_ns8250.c
+@@ -873,7 +873,7 @@ int
+ ns8250_bus_probe(struct uart_softc *sc)
+ {
+ 	struct uart_bas *bas;
+-	int count, delay, error, limit;
++	int count, delay, error, fifosz, limit;
+ 	uint8_t lsr, mcr, ier;
+ 
+ 	bas = &sc->sc_bas;
+@@ -893,6 +893,26 @@ ns8250_bus_probe(struct uart_softc *sc)
+ 	if (error)
+ 		return (error);
+ 
++	/*
++	 * The FIFO size can be given with the hw.uart.ns8250_fifo_size
++	 * tunable instead of being measured below. The measurement relies
++	 * on loopback mode, and puts garbage on the wire of (emulated) UARTs
++	 * that do not implement it.
++	 */
++	fifosz = 0;
++	if (TUNABLE_INT_FETCH("hw.uart.ns8250_fifo_size", &fifosz) &&
++	    fifosz > 0) {
++		uart_setreg(bas, REG_FCR, FCR_ENABLE | FCR_XMT_RST |
++		    FCR_RCV_RST);
++		uart_setreg(bas, REG_MCR, mcr);
++		uart_barrier(bas);
++		ns8250_flush(bas, UART_FLUSH_RECEIVER|UART_FLUSH_TRANSMITTER);
++		sc->sc_rxfifosz = fifosz;
++		sc->sc_txfifosz = 16;
++		device_set_desc(sc->sc_dev, "16550 or compatible");
++		return (0);
++	}
++
+ 	/*
+ 	 * Set loopback mode. This avoids having garbage on the wire and
+ 	 * also allows us send and receive data. We set DTR and RTS to

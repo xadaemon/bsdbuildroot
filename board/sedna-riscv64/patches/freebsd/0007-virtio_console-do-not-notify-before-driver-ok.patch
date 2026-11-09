@@ -1,0 +1,112 @@
+virtio_console: do not notify the device before DRIVER_OK
+
+vtcon_attach() queued the receive buffers and notified the device, and
+sent the VIRTIO_CONSOLE_DEVICE_READY control message and waited for its
+completion. But the transport only sets DRIVER_OK after attach returns,
+and the driver must not notify the device before that (virtio 1.0,
+3.1.1). Devices that hold to it, such as Sedna's, ignore the
+notifications (or flag an error), never complete the message, and boot
+hangs in virtqueue_poll().
+
+Queue the receive buffers during attach as before, but notify the device
+of them, and send DEVICE_READY, from the attach_completed method, like
+vtblk and vtnet do their post-DRIVER_OK work.
+
+diff --git a/sys/dev/virtio/console/virtio_console.c b/sys/dev/virtio/console/virtio_console.c
+index 66433565ce25..ba8fee849df0 100644
+--- a/sys/dev/virtio/console/virtio_console.c
++++ b/sys/dev/virtio/console/virtio_console.c
+@@ -109,6 +109,7 @@ struct vtcon_softc {
+ #define VTCON_FLAG_DETACHED	0x01
+ #define VTCON_FLAG_SIZE		0x02
+ #define VTCON_FLAG_MULTIPORT	0x04
++#define VTCON_FLAG_DRIVER_OK	0x08
+ 
+ 	/*
+ 	 * Ports can be added and removed during runtime, but we have
+@@ -151,6 +152,7 @@ static void	 vtcon_drain_all(void);
+ 
+ static int	 vtcon_probe(device_t);
+ static int	 vtcon_attach(device_t);
++static int	vtcon_attach_completed(device_t);
+ static int	 vtcon_detach(device_t);
+ static int	 vtcon_config_change(device_t);
+ 
+@@ -248,6 +250,7 @@ static device_method_t vtcon_methods[] = {
+ 	DEVMETHOD(device_detach,	vtcon_detach),
+ 
+ 	/* VirtIO methods. */
++	DEVMETHOD(virtio_attach_completed, vtcon_attach_completed),
+ 	DEVMETHOD(virtio_config_change,	vtcon_config_change),
+ 
+ 	DEVMETHOD_END
+@@ -369,9 +372,6 @@ vtcon_attach(device_t dev)
+ 
+ 	vtcon_enable_interrupts(sc);
+ 
+-	vtcon_ctrl_send_control(sc, VIRTIO_CONSOLE_BAD_ID,
+-	    VIRTIO_CONSOLE_DEVICE_READY, 1);
+-
+ fail:
+ 	if (error)
+ 		vtcon_detach(dev);
+@@ -379,6 +379,37 @@ vtcon_attach(device_t dev)
+ 	return (error);
+ }
+ 
++/*
++ * The driver must not notify the device before the transport has set
++ * DRIVER_OK (virtio 1.0, 3.1.1), and devices that hold to it ignore such
++ * notifications. So the receive buffers queued during attach are announced
++ * here, and only then the device is told we are ready.
++ */
++static int
++vtcon_attach_completed(device_t dev)
++{
++	struct vtcon_softc *sc;
++	struct vtcon_softc_port *scport;
++
++	sc = device_get_softc(dev);
++
++	VTCON_LOCK(sc);
++	sc->vtcon_flags |= VTCON_FLAG_DRIVER_OK;
++	if ((sc->vtcon_flags & VTCON_FLAG_MULTIPORT) != 0) {
++		virtqueue_notify(sc->vtcon_ctrl_rxvq);
++	} else {
++		scport = &sc->vtcon_ports[0];
++		if (scport->vcsp_port != NULL)
++			virtqueue_notify(scport->vcsp_invq);
++	}
++	VTCON_UNLOCK(sc);
++
++	vtcon_ctrl_send_control(sc, VIRTIO_CONSOLE_BAD_ID,
++	    VIRTIO_CONSOLE_DEVICE_READY, 1);
++
++	return (0);
++}
++
+ static int
+ vtcon_detach(device_t dev)
+ {
+@@ -669,7 +700,9 @@ vtcon_ctrl_event_populate(struct vtcon_softc *sc)
+ 	}
+ 
+ 	if (nbufs > 0) {
+-		virtqueue_notify(vq);
++		/* Before DRIVER_OK, vtcon_attach_completed() notifies. */
++		if ((sc->vtcon_flags & VTCON_FLAG_DRIVER_OK) != 0)
++			virtqueue_notify(vq);
+ 		error = 0;
+ 	}
+ 
+@@ -1066,7 +1099,9 @@ vtcon_port_populate(struct vtcon_port *port)
+ 	}
+ 
+ 	if (nbufs > 0) {
+-		virtqueue_notify(vq);
++		/* Before DRIVER_OK, vtcon_attach_completed() notifies. */
++		if ((port->vtcport_sc->vtcon_flags & VTCON_FLAG_DRIVER_OK) != 0)
++			virtqueue_notify(vq);
+ 		error = 0;
+ 	}
+ 

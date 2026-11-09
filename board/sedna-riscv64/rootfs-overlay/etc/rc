@@ -1,0 +1,53 @@
+#!/bin/sh
+#
+# Boot script, run by init(8). Plays the part of busybox's sysinit entries and
+# /etc/init.d/rcS in the Linux image: mount things, then start the scripts in
+# /etc/rc.d named S??* in order. The full rc.d(8) system is not installed.
+#
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+HOME=/
+export PATH HOME
+
+trap : INT QUIT TSTP
+
+# The kernel mounts / read-only. Check it first: OC2 machines are often just
+# switched off.
+fsck -p
+case $? in
+0) ;;
+8)
+	echo "Automatic file system check failed, running fsck -y"
+	fsck -y
+	;;
+*)
+	echo "fsck failed, / stays read-only"
+	;;
+esac
+mount -u -o rw /
+mount -a
+swapon -a 2>/dev/null
+
+# Left over from the previous run, / is persistent. /var/log is a tmpfs.
+rm -rf /var/run/* /var/tmp/* 2>/dev/null
+: > /var/run/utx.active
+for log in utx.lastlogin utx.log messages auth.log; do
+	: > "/var/log/$log"
+done
+
+hostname "$(cat /etc/hostname 2>/dev/null || echo localhost)"
+ifconfig lo0 inet 127.0.0.1/8 up
+
+for script in /etc/rc.d/S??*; do
+	[ -f "$script" ] || continue
+	case "$script" in
+	*.sh)
+		(set start; . "$script")
+		;;
+	*)
+		sh "$script" start
+		;;
+	esac
+done
+
+exit 0

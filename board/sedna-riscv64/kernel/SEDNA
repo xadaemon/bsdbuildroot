@@ -1,0 +1,87 @@
+#
+# SEDNA -- kernel configuration for the Sedna RISC-V virtual machine.
+#
+# The counterpart of the Linux tree's board/sedna-riscv64/linux.config. Kept
+# small: one hart, no modules, only the devices Sedna emulates:
+#
+#   - RV64IMAFDC hart, Sv39/Sv48, SBI base/TIME/RFENCE from sedna-fw
+#   - CLINT (via SBI timer) and PLIC ("riscv,plic0")
+#   - ns16550a UART, the console
+#   - virtio-mmio: block, network, console, 9p file system
+#   - Goldfish RTC
+#   - Sedna system controller ("sedna,syscon"): poweroff, reboot, host requests
+#
+# The root file system is UFS; sedna-fw finds the kernel in a small ext2 file
+# system at the start of the same disk, see configs/sedna-riscv64.conf.
+#
+# There is no loader(8): sedna-fw loads the kernel straight from /boot/Image,
+# so the root file system and anything else normally set in loader.conf(5) is
+# compiled in. Extra kernel environment variables and boot flags (-s, -v) can
+# be passed in /chosen/bootargs.
+#
+# Not supported yet (no FreeBSD drivers): virtio-input keyboard, virtio-sound.
+#
+
+cpu		RISCV
+ident		SEDNA
+
+makeoptions	DEBUG=-g		# kernel.debug for gdb; Image is stripped
+makeoptions	MODULES_OVERRIDE=""	# no loader, so no modules
+
+options 	SCHED_ULE
+options 	PREEMPTION
+options 	HZ=100			# same as the Linux kernel, cheaper to emulate
+
+options 	INET
+options 	TCP_HHOOK
+
+# File systems.
+options 	FFS
+options 	SOFTUPDATES
+options 	EXT2FS			# the boot area, and OC2's Linux disks
+options 	TMPFS
+options 	P9FS			# virtio 9p host file systems
+options 	GEOM_LABEL		# /dev/ufs/<label>
+options 	ROOTDEVNAME=\"ufs:/dev/ufs/sedna_freebsd\"
+
+options 	_KPOSIX_PRIORITY_SCHEDULING
+options 	CAPABILITY_MODE
+options 	CAPABILITIES
+options 	PRINTF_BUFR_SIZE=128
+options 	KTRACE			# also: 15.1's subr_syscall.c fails to build without it
+options 	SYSVSHM
+options 	SYSVSEM
+options 	SYSVMSG
+
+options 	KDB
+options 	DDB
+options 	KDB_TRACE
+
+options 	FDT
+device		clk			# needed by ofw_cpu
+
+# Pseudo devices.
+device		loop
+device		ether
+device		bpf			# dhclient(8)
+device		md
+device		tuntap
+
+# Serial console. Sedna's 16550A has a 16 byte FIFO and no loopback mode, so
+# don't let the driver measure the FIFO (patch 0006): that sends NULs to the
+# terminal.
+device		uart
+device		uart_ns8250
+envvar		hw.uart.ns8250_fifo_size=16
+
+# VirtIO over MMIO.
+device		virtio
+device		virtio_mmio
+device		virtio_blk
+device		vtnet
+device		virtio_console
+device		virtio_p9fs
+
+device		goldfish_rtc
+
+device		sedna_syscon

@@ -1,0 +1,6 @@
+{
+  "pack": {
+    "description": "FreeBSD for OpenComputers II: a bootable hard drive image",
+    "pack_format": 48
+  }
+}

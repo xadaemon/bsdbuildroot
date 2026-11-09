@@ -1,0 +1,7 @@
+#
+# ttys(5). A login prompt on the console, like the Linux image's getty on
+# console; root has no password. The terminal type is screen, which is what
+# OC2's terminal speaks. The getty entry is in /etc/gettytab.
+#
+# name	getty				type	status	comments
+console	"/usr/libexec/getty sedna.console"	screen	on	secure

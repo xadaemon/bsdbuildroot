@@ -1,0 +1,82 @@
+fdt: use all memory nodes
+
+fdt_foreach_mem_region() only looked at the first /memory node. Device
+trees may describe memory in several top level nodes with device_type
+"memory"; Sedna, for one, has a node per memory device. Walk all of them,
+as Linux does.
+
+diff --git a/sys/dev/fdt/fdt_common.c b/sys/dev/fdt/fdt_common.c
+index f43551c6310e..8f58dce25f1f 100644
+--- a/sys/dev/fdt/fdt_common.c
++++ b/sys/dev/fdt/fdt_common.c
+@@ -493,20 +493,15 @@ fdt_foreach_reserved_mem(fdt_mem_region_cb cb, void *arg)
+ 	return (0);
+ }
+ 
+-int
+-fdt_foreach_mem_region(fdt_mem_region_cb cb, void *arg)
++static int
++fdt_foreach_mem_node_region(phandle_t memory, fdt_mem_region_cb cb, void *arg)
+ {
+ 	struct mem_region mr;
+ 	pcell_t reg[FDT_REG_CELLS * FDT_MEM_REGIONS];
+ 	pcell_t *regp;
+-	phandle_t memory;
+ 	int addr_cells, size_cells;
+ 	int i, reg_len, rv, tuple_size, tuples;
+ 
+-	memory = OF_finddevice("/memory");
+-	if (memory == -1)
+-		return (ENXIO);
+-
+ 	if ((rv = fdt_addrsize_cells(OF_parent(memory), &addr_cells,
+ 	    &size_cells)) != 0)
+ 		return (rv);
+@@ -541,6 +536,47 @@ fdt_foreach_mem_region(fdt_mem_region_cb cb, void *arg)
+ 	return (0);
+ }
+ 
++static bool
++fdt_is_memory_node(phandle_t node)
++{
++	char buf[16];
++	char *at;
++
++	if (OF_getprop(node, "device_type", buf, sizeof(buf)) > 0)
++		return (strncmp(buf, "memory", sizeof(buf)) == 0);
++
++	/* No device_type: go by the node name, as OF_finddevice() does. */
++	if (OF_getprop(node, "name", buf, sizeof(buf)) <= 0)
++		return (false);
++	buf[sizeof(buf) - 1] = '\0';
++	if ((at = strchr(buf, '@')) != NULL)
++		*at = '\0';
++	return (strcmp(buf, "memory") == 0);
++}
++
++/*
++ * Calls cb for each region of each memory node. Memory may be split across
++ * several nodes, e.g. one per memory device on the Sedna virtual machine; all
++ * of them are top level nodes with device_type "memory".
++ */
++int
++fdt_foreach_mem_region(fdt_mem_region_cb cb, void *arg)
++{
++	phandle_t node;
++	int found, rv;
++
++	found = 0;
++	for (node = OF_child(OF_peer(0)); node != 0; node = OF_peer(node)) {
++		if (!fdt_is_memory_node(node))
++			continue;
++		if ((rv = fdt_foreach_mem_node_region(node, cb, arg)) != 0)
++			return (rv);
++		found++;
++	}
++
++	return (found > 0 ? 0 : ENXIO);
++}
++
+ int
+ fdt_get_chosen_bootargs(char *bootargs, size_t max_size)
+ {

@@ -1,0 +1,25 @@
+#!/bin/sh
+#
+# Shutdown script, run by init(8) before it kills everything and reboots or
+# powers off. Stops the /etc/rc.d scripts in reverse order.
+#
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+
+for script in $(ls -r /etc/rc.d/S??* 2>/dev/null); do
+	[ -f "$script" ] || continue
+	case "$script" in
+	*.sh)
+		(set stop; . "$script")
+		;;
+	*)
+		sh "$script" stop
+		;;
+	esac
+done
+
+swapoff -a 2>/dev/null
+sync
+
+exit 0

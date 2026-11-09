@@ -1,0 +1,198 @@
+riscv: add a driver for the Sedna system controller
+
+The Sedna RISC-V virtual machine powers off and resets through a small
+system controller ("sedna,syscon"), and raises its interrupt when the host
+asks the guest to power off or reboot. Its firmware has no SBI SRST
+extension, so this is the only way to power the machine off.
+
+Write the command register in shutdown_final, and turn host requests into
+an orderly shutdown_nice(). Equivalent to the sedna-syscon driver of the
+Sedna Linux tree.
+
+diff --git a/sys/conf/files.riscv b/sys/conf/files.riscv
+index 6254c237b047..fdbc250738a3 100644
+--- a/sys/conf/files.riscv
++++ b/sys/conf/files.riscv
+@@ -75,6 +75,7 @@ riscv/riscv/pmap.c		standard
+ riscv/riscv/ptrace_machdep.c	standard
+ riscv/riscv/riscv_console.c	optional	rcons
+ riscv/riscv/riscv_syscon.c	optional	syscon riscv_syscon fdt
++riscv/sedna/sedna_syscon.c	optional	sedna_syscon fdt
+ riscv/riscv/sigtramp.S		standard
+ riscv/riscv/sbi.c		standard
+ riscv/riscv/sbi_ipi.c		optional	smp
+diff --git a/sys/riscv/sedna/sedna_syscon.c b/sys/riscv/sedna/sedna_syscon.c
+new file mode 100644
+index 000000000000..50bd449869b9
+--- /dev/null
++++ b/sys/riscv/sedna/sedna_syscon.c
+@@ -0,0 +1,169 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Matheus Xavier
++ *
++ * Sedna system controller.
++ *
++ * The Sedna RISC-V virtual machine has a small system controller that the
++ * guest writes to in order to power off or reset the machine, and that raises
++ * an interrupt when the host asks the guest to power off or reboot. Until the
++ * guest sets the enable bit in the control register, the host does not ask and
++ * just powers the machine off.
++ *
++ * Register layout (32 bit registers):
++ *   0x00 command  W: 0x1000 resets, 0x2000 powers off the machine.
++ *   0x04 id       R: 'S' 'S' 'C' <version>
++ *   0x08 control  RW: bit 1 enables host requests.
++ *   0x0c status   R: pending host requests, bit 0 poweroff, bit 1 reboot.
++ *                 W: writing 1 clears a pending request.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/eventhandler.h>
++#include <sys/kernel.h>
++#include <sys/module.h>
++#include <sys/reboot.h>
++#include <sys/rman.h>
++
++#include <machine/bus.h>
++
++#include <dev/ofw/ofw_bus.h>
++#include <dev/ofw/ofw_bus_subr.h>
++
++#define	SEDNA_SYSCON_COMMAND		0x00
++#define	 SEDNA_SYSCON_COMMAND_RESET	0x1000
++#define	 SEDNA_SYSCON_COMMAND_POWEROFF	0x2000
++#define	SEDNA_SYSCON_ID			0x04
++#define	 SEDNA_SYSCON_ID_MASK		0xffffff00
++#define	 SEDNA_SYSCON_ID_VALUE		('S' << 24 | 'S' << 16 | 'C' << 8)
++#define	SEDNA_SYSCON_CONTROL		0x08
++#define	 SEDNA_SYSCON_CONTROL_ENABLE	(1u << 1)
++#define	SEDNA_SYSCON_STATUS		0x0c
++#define	 SEDNA_SYSCON_STATUS_POWEROFF	(1u << 0)
++#define	 SEDNA_SYSCON_STATUS_REBOOT	(1u << 1)
++
++struct sedna_syscon_softc {
++	device_t		dev;
++	struct resource		*res[2];
++	void			*intrhand;
++	eventhandler_tag	shutdown_tag;
++};
++
++static struct resource_spec sedna_syscon_spec[] = {
++	{ SYS_RES_MEMORY,	0,	RF_ACTIVE },
++	{ SYS_RES_IRQ,		0,	RF_ACTIVE | RF_OPTIONAL },
++	RESOURCE_SPEC_END
++};
++
++static struct ofw_compat_data compat_data[] = {
++	{ "sedna,syscon",	1 },
++	{ NULL,			0 }
++};
++
++#define	RD4(sc, reg)		bus_read_4((sc)->res[0], (reg))
++#define	WR4(sc, reg, val)	bus_write_4((sc)->res[0], (reg), (val))
++
++static void
++sedna_syscon_intr(void *arg)
++{
++	struct sedna_syscon_softc *sc = arg;
++	uint32_t status;
++
++	status = RD4(sc, SEDNA_SYSCON_STATUS);
++	WR4(sc, SEDNA_SYSCON_STATUS, status);
++
++	if ((status & SEDNA_SYSCON_STATUS_POWEROFF) != 0) {
++		device_printf(sc->dev, "poweroff requested\n");
++		shutdown_nice(RB_POWEROFF);
++	} else if ((status & SEDNA_SYSCON_STATUS_REBOOT) != 0) {
++		device_printf(sc->dev, "reboot requested\n");
++		shutdown_nice(RB_AUTOBOOT);
++	}
++}
++
++static void
++sedna_syscon_shutdown(void *arg, int howto)
++{
++	struct sedna_syscon_softc *sc = arg;
++
++	if ((howto & RB_POWEROFF) != 0)
++		WR4(sc, SEDNA_SYSCON_COMMAND, SEDNA_SYSCON_COMMAND_POWEROFF);
++	else if ((howto & RB_HALT) == 0)
++		WR4(sc, SEDNA_SYSCON_COMMAND, SEDNA_SYSCON_COMMAND_RESET);
++}
++
++static int
++sedna_syscon_probe(device_t dev)
++{
++	if (!ofw_bus_status_okay(dev))
++		return (ENXIO);
++	if (ofw_bus_search_compatible(dev, compat_data)->ocd_data == 0)
++		return (ENXIO);
++
++	device_set_desc(dev, "Sedna system controller");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++sedna_syscon_attach(device_t dev)
++{
++	struct sedna_syscon_softc *sc;
++	uint32_t id;
++	int error;
++
++	sc = device_get_softc(dev);
++	sc->dev = dev;
++
++	if (bus_alloc_resources(dev, sedna_syscon_spec, sc->res) != 0) {
++		device_printf(dev, "cannot allocate resources\n");
++		return (ENXIO);
++	}
++
++	id = RD4(sc, SEDNA_SYSCON_ID);
++	if ((id & SEDNA_SYSCON_ID_MASK) != SEDNA_SYSCON_ID_VALUE) {
++		device_printf(dev, "unexpected id %08x\n", id);
++		bus_release_resources(dev, sedna_syscon_spec, sc->res);
++		return (ENXIO);
++	}
++
++	/* Runs before the SBI handler, the firmware has no SRST extension. */
++	sc->shutdown_tag = EVENTHANDLER_REGISTER(shutdown_final,
++	    sedna_syscon_shutdown, sc, SHUTDOWN_PRI_LAST - 100);
++
++	if (sc->res[1] == NULL) {
++		device_printf(dev, "no interrupt, host requests disabled\n");
++		return (0);
++	}
++
++	WR4(sc, SEDNA_SYSCON_STATUS,
++	    SEDNA_SYSCON_STATUS_POWEROFF | SEDNA_SYSCON_STATUS_REBOOT);
++	error = bus_setup_intr(dev, sc->res[1], INTR_TYPE_MISC | INTR_MPSAFE,
++	    NULL, sedna_syscon_intr, sc, &sc->intrhand);
++	if (error != 0) {
++		device_printf(dev, "cannot set up interrupt, host requests "
++		    "disabled\n");
++		return (0);
++	}
++
++	/* From here on the host asks before powering off the machine. */
++	WR4(sc, SEDNA_SYSCON_CONTROL, SEDNA_SYSCON_CONTROL_ENABLE);
++
++	return (0);
++}
++
++static device_method_t sedna_syscon_methods[] = {
++	DEVMETHOD(device_probe,		sedna_syscon_probe),
++	DEVMETHOD(device_attach,	sedna_syscon_attach),
++	DEVMETHOD_END
++};
++
++static driver_t sedna_syscon_driver = {
++	"sedna_syscon",
++	sedna_syscon_methods,
++	sizeof(struct sedna_syscon_softc)
++};
++
++DRIVER_MODULE(sedna_syscon, simplebus, sedna_syscon_driver, 0, 0);

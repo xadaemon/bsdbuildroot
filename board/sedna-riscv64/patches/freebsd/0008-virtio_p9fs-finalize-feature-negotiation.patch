@@ -1,0 +1,24 @@
+virtio_p9fs: finalize feature negotiation
+
+vt9p_attach() negotiated features but, unlike every other virtio driver,
+never called virtio_finalize_features(), so FEATURES_OK was never set.
+Legacy devices do not care, but modern (virtio 1.0) devices may refuse to
+process requests until it is; with Sedna's, the first request (Tversion)
+is never answered and mounting times out after 120 seconds.
+
+diff --git a/sys/dev/virtio/p9fs/virtio_p9fs.c b/sys/dev/virtio/p9fs/virtio_p9fs.c
+index 2b276a60aa9a..b9689ba319fa 100644
+--- a/sys/dev/virtio/p9fs/virtio_p9fs.c
++++ b/sys/dev/virtio/p9fs/virtio_p9fs.c
+@@ -324,6 +324,11 @@ vt9p_attach(device_t dev)
+ 	/* Negotiate the features from the host */
+ 	virtio_set_feature_desc(dev, virtio_9p_feature_desc);
+ 	virtio_negotiate_features(dev, VIRTIO_9PNET_F_MOUNT_TAG);
++	error = virtio_finalize_features(dev);
++	if (error != 0) {
++		device_printf(dev, "cannot finalize features\n");
++		goto out;
++	}
+ 
+ 	/*
+ 	 * If mount tag feature is supported read the mount tag

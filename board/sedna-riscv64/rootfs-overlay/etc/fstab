@@ -1,0 +1,5 @@
+# Device			Mountpoint	FStype	Options		Dump	Pass#
+/dev/ufs/sedna_freebsd		/		ufs	rw		1	1
+tmpfs				/tmp		tmpfs	rw,mode=1777	0	0
+# Logs live in memory, as in the Linux image; the disk is small.
+tmpfs				/var/log	tmpfs	rw,size=1m,mode=755	0	0

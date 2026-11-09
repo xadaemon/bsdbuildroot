@@ -1,0 +1,15 @@
+// Gradle init script for test/Makefile: builds Sedna with the installed JDK
+// and copies its jar plus runtime dependencies to -Dsedna.libdir.
+
+allprojects {
+    afterEvaluate { p ->
+        if (p.plugins.hasPlugin('java')) {
+            p.java.toolchain.languageVersion = JavaLanguageVersion.of(Integer.getInteger('sedna.java', 25))
+            p.tasks.register('sednaRuntimeLibs', Copy) {
+                from p.configurations.runtimeClasspath
+                from p.tasks.named('jar')
+                into System.getProperty('sedna.libdir')
+            }
+        }
+    }
+}

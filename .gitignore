@@ -1,0 +1,4 @@
+output/
+test/build/
+local.mk
+.DS_Store
