@@ -69,6 +69,12 @@ at the login prompt. The disk is 24 MB: 5 MB boot area, 19 MB root with
    driver, p9fs never set `FEATURES_OK`; Sedna's (modern) 9p device then
    never answers, and mounting `/mnt/builtin` hung for 120 seconds.
 
+The `src` stage commits the patches to a local `sedna` branch, with a fixed
+author and dates, rather than leaving them as changes in the work tree. With
+a clean tree the kernel's version string (`uname -a`) is reproducible: just
+`FreeBSD 15.1-RELEASE-p6 sedna-<hash> SEDNA`, without the build user, host
+and time that FreeBSD records for modified trees.
+
 The kernel configuration also needs `options KTRACE`: without it, 15.1's
 `subr_syscall.c` does not build.
 

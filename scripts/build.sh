@@ -79,29 +79,42 @@ stage_src() {
 	if [ ! -d "$SRC/.git" ]; then
 		msg "Cloning $FREEBSD_REPO ($FREEBSD_BRANCH)"
 		git clone --depth 1 -b "$FREEBSD_BRANCH" "$FREEBSD_REPO" "$SRC"
-		rm -f "$STAMPS/patches"
 	elif [ -n "${UPDATE_SRC:-}" ]; then
 		msg "Updating sources ($FREEBSD_BRANCH)"
 		git -C "$SRC" fetch --depth 1 origin "$FREEBSD_BRANCH"
-		git -C "$SRC" checkout -q -f FETCH_HEAD
-		rm -f "$STAMPS/patches"
 	fi
+	base=$(git -C "$SRC" rev-parse "origin/$FREEBSD_BRANCH")
 
-	want="$(git -C "$SRC" rev-parse HEAD) $(patches_hash)"
+	want="v2 $base $(patches_hash)"
 	if [ "$(cat "$STAMPS/patches" 2>/dev/null)" = "$want" ]; then
 		msg "Sources up to date, patches applied"
 		return
 	fi
 
-	msg "Applying patches from $PATCH_DIR"
-	# Back to pristine sources; only files the patches touched change, so
-	# incremental builds stay incremental.
-	git -C "$SRC" checkout -q -f HEAD -- .
+	# The patches are committed to a local branch, "sedna", on top of the
+	# upstream commit. A clean tree keeps the kernel's version string
+	# reproducible: newvers.sh -R leaves out the build user, host and time
+	# unless the tree has uncommitted changes. Author and dates are fixed,
+	# so the commits, and the hash in the version, only depend on the
+	# sources and the patches.
+	msg "Applying patches from $PATCH_DIR to branch sedna"
+	# Only files the patches touch change, so builds stay incremental.
+	git -C "$SRC" checkout -q -f -B sedna "$base"
 	git -C "$SRC" clean -q -fd -- sys tools
+	date=$(git -C "$SRC" log -1 --format=%cI "$base")
 	for patch in "$PATCH_DIR"/*.patch; do
 		[ -f "$patch" ] || continue
 		msg "  $(basename "$patch")"
-		git -C "$SRC" apply --whitespace=nowarn "$TOP/$patch"
+		git -C "$SRC" apply --index --whitespace=nowarn "$TOP/$patch"
+		# The commit message is the text before the diff.
+		sed -n '/^diff --git/q;p' "$patch" > "$WORK/patch.msg"
+		[ -s "$WORK/patch.msg" ] || basename "$patch" .patch > "$WORK/patch.msg"
+		env GIT_AUTHOR_NAME="Sedna FreeBSD build" \
+		    GIT_AUTHOR_EMAIL="build@sedna.invalid" GIT_AUTHOR_DATE="$date" \
+		    GIT_COMMITTER_NAME="Sedna FreeBSD build" \
+		    GIT_COMMITTER_EMAIL="build@sedna.invalid" \
+		    GIT_COMMITTER_DATE="$date" \
+		    git -C "$SRC" commit -q --no-verify -F "$WORK/patch.msg"
 	done
 	echo "$want" > "$STAMPS/patches"
 }
