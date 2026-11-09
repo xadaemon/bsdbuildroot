@@ -209,6 +209,7 @@ Output in `output/images`:
 | [`board/sedna-riscv64/hostname-from-mac`](board/sedna-riscv64/hostname-from-mac) | its `etc/init.d/S01hostname`, optional here |
 | [`board/sedna-riscv64/mlapi`](board/sedna-riscv64/mlapi) | (OC2's `include/mlapi.h`, and `mlapi(1)`) |
 | [`rootfs-overlay/etc/rc.d/S91oc2`](board/sedna-riscv64/rootfs-overlay/etc/rc.d/S91oc2) | (OC2's `init.d/S20export_lua_path` and `S25oc2busd`) |
+| [`rootfs-overlay/usr/sbin/initdisks`](board/sedna-riscv64/rootfs-overlay/usr/sbin/initdisks), [`etc/rc.d/S10disks`](board/sedna-riscv64/rootfs-overlay/etc/rc.d/S10disks) | (none: more hard drives, see [More hard drives](#more-hard-drives)) |
 | [`rootfs-overlay/usr/share/flua/cjson.lua`](board/sedna-riscv64/rootfs-overlay/usr/share/flua/cjson.lua) | (the `lua-cjson` package) |
 | [`board/sedna-riscv64/post-build.sh`](board/sedna-riscv64/post-build.sh) | `board/sedna-riscv64/post-build.sh` |
 | [`scripts/build.sh`](scripts/build.sh) | buildroot's `make` |
@@ -237,6 +238,25 @@ OC2 copies the image onto a drive the first time the drive is used, so after
 updating the data pack take a fresh drive from the creative tab.
 
 Made for OpenComputers II 0.11.0 on Minecraft 1.21.1 (NeoForge).
+
+### More hard drives
+
+`initdisks` sets up the computer's other hard drives: a UFS file system
+(soft updates) with a volume label, mounted at `/mnt/<label>`.
+
+```sh
+initdisks                 # the disks and what is on them
+initdisks -a              # every blank disk, as disk1, disk2, ...
+initdisks vtbd1 games     # one disk, labelled "games": /mnt/games
+initdisks -f vtbd1        # also if it is not blank: erases it
+```
+
+At boot, `/etc/rc.d/S10disks` checks and mounts every UFS file system with
+a label at `/mnt/<label>`, so the drives come back after a restart, and a
+drive set up in another computer is mounted too. Disks `/etc/fstab` lists
+are left to it. The system disk is never touched. Give drives that move
+between computers distinct labels: with two of the same, only one is
+mounted.
 
 ### High-level API
 

@@ -1,0 +1,64 @@
+#!/bin/sh
+#
+# Mounts the machine's other disks: every UFS file system with a volume
+# label, as initdisks(8) makes them, at /mnt/<label>, checked first (OC2
+# computers are often just switched off). A disk moved here from another
+# computer is mounted too. The root file system and disks /etc/fstab lists
+# are left alone.
+#
+
+# The volume labels of the file systems to mount.
+labels() {
+	root=$(mount -p | awk '$2 == "/" { print $1 }')
+	for dev in /dev/ufs/*; do
+		[ -e "$dev" ] || continue
+		[ "$dev" = "$root" ] && continue
+		grep -q "^[[:space:]]*$dev[[:space:]]" /etc/fstab && continue
+		label=${dev#/dev/ufs/}
+		# /mnt/builtin is OC2's file system (S90p9fs).
+		[ "$label" = builtin ] && continue
+		echo "$label"
+	done
+}
+
+mounted() {
+	mount -p | awk -v dev="$1" '$1 == dev { found = 1 } END { exit !found }'
+}
+
+start() {
+	todo=
+	for label in $(labels); do
+		mounted "/dev/ufs/$label" || todo="$todo $label"
+	done
+	[ -n "$todo" ] || return 0
+	printf 'Mounting disks:'
+	for label in $todo; do
+		dev="/dev/ufs/$label"
+		printf ' %s' "$label"
+		if ! fsck_ufs -p "$dev" >/dev/null 2>&1 &&
+		    ! fsck_ufs -y "$dev" >/dev/null 2>&1; then
+			printf ' (fsck failed, not mounted)'
+			continue
+		fi
+		mkdir -p "/mnt/$label" &&
+		    mount -t ufs "$dev" "/mnt/$label" 2>/dev/null ||
+		    printf ' (mount failed)'
+	done
+	printf '\n'
+}
+
+stop() {
+	for label in $(labels); do
+		mounted "/dev/ufs/$label" && umount "/dev/ufs/$label"
+	done
+}
+
+case "$1" in
+	start|stop)
+		"$1" ;;
+	restart|reload)
+		stop; start ;;
+	*)
+		echo "Usage: $0 {start|stop|restart|reload}"
+		exit 1 ;;
+esac
