@@ -15,7 +15,7 @@ FreeBSD gets a UFS root (ext2 leaves its first 1024 bytes unused):
 sector 0      MBR, two FreeBSD (165) partitions: the UFS root and the swap
 byte 1024     small ext2 file system with only /boot/Image   (what sedna-fw reads)
 next MiB      UFS2 root, soft updates, label sedna_freebsd   (what FreeBSD mounts)
-last 8 MiB    swap, glabel label sedna_swap
+last 16 MiB   swap, glabel label sedna_swap
 ```
 
 ## What is in the image
@@ -42,11 +42,11 @@ Goldfish RTC, PLIC, SBI timer, OC2's mid-level API, UFS root mounted by label, e
 
 It runs in OC2's largest configuration, 4 × 8 MB memory: about 25 MB usable
 (`hw.physmem`) after the firmware's 2 MB, of which the kernel keeps ~9 MB;
-~4 MB is free at the login prompt with oc2busd running. The disk is 32 MB:
-5 MB boot area, 19 MB root with ~6 MB free, and 8 MB swap, so programs that
-sit idle make room for others: about a dozen Lua programs using the
-high-level API run at once next to oc2busd (5 without swap and the kernel
-settings below).
+~4 MB is free at the login prompt with oc2busd running. The disk is 40 MB:
+5 MB boot area, 19 MB root with ~6 MB free, and 16 MB swap, so programs that
+sit idle make room for others: about 18 Lua programs using the high-level
+API run at once next to oc2busd (5 without swap and the kernel settings
+below).
 
 ### Patches to FreeBSD ([`board/sedna-riscv64/patches/freebsd`](board/sedna-riscv64/patches/freebsd))
 
