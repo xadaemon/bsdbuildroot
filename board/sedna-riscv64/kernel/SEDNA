@@ -44,6 +44,18 @@ options 	TMPFS
 # default: most of what is free on this machine. 512 KB is still above the
 # page daemon's minimum (vm.stats.vm.v_free_min).
 makeoptions	CONF_CFLAGS=-DTMPFS_PAGES_MINRESERVED=128
+
+# Memory the kernel sets aside is wired, never swapped out; the defaults are
+# sized for larger machines than ~23 MB:
+#  - The buffer cache, whose pages are wired while it holds them, could grow
+#    to a quarter of RAM (6 MB here); 128 buffers cap it at 2 MB.
+#  - maxphys, the largest single transfer, sizes every I/O buffer: 1 MB by
+#    default. Sedna's disks take 16 KB segments anyway (patch 0005).
+#  - devctl queues device events for devd(8), which does not run here; its
+#    queue was set up front (220 KB). 0 drops the events instead.
+envvar		kern.nbuf=128
+envvar		kern.maxphys=131072
+envvar		hw.bus.devctl_queue=0
 options 	P9FS			# virtio 9p host file systems
 options 	GEOM_LABEL		# /dev/ufs/<label>
 options 	ROOTDEVNAME=\"ufs:/dev/ufs/sedna_freebsd\"

@@ -8,19 +8,22 @@
 #    are ttys on FreeBSD (/dev/ttyV0.N, /dev/vtcon/<name>): make them raw,
 #    and list them like Linux's /sys/class/virtio-ports, where the libraries
 #    look them up.
+#  - Serial interface cards, uart(4) here, are named as on Linux: /dev/ttyS1
+#    for the first (ttyS0 is the console), and their register addresses are
+#    listed in /sys/class/tty, where OC2's oc2.serial tells them apart.
 #  - LUA_PATH includes /mnt/builtin/lib/lua, like OC2's S20export_lua_path.
 #  - oc2busd, which shares the ports between programs, runs under daemon(8)
-#    (restarted if it stops, output to syslog), like OC2's S25oc2busd.
+#    (restarted if it stops, output to syslog), like OC2's S25oc2busd, and
+#    protect(1)ed from being killed when memory runs out.
 #    touch /etc/oc2busd.disabled to not start it; programs then open the
-#    ports directly, one at a time. While it runs, programs must not open
-#    the ports themselves (e.g. with OC2_BUS_SOCKET=none): FreeBSD lets a
-#    port be opened twice, where Linux refuses with EBUSY.
+#    ports directly, one at a time (a port is busy while it is open).
 #
 
 BUILTIN="/mnt/builtin"
 LUA_LIB="$BUILTIN/lib/lua"
 DAEMON="$BUILTIN/bin/oc2busd.lua"
 PORTS="/sys/class/virtio-ports"
+TTYS="/sys/class/tty"
 PID_FILE="/run/oc2busd.pid"
 PROFILE="/etc/profile.d/lua_path.sh"
 
@@ -45,9 +48,30 @@ setup_ports() {
 	done
 }
 
+setup_serial() {
+	rm -rf "$TTYS"
+	# uart0 is the console, the cards follow it in the device tree.
+	for unit in $(sysctl -N dev.uart 2>/dev/null |
+	    sed -n 's/^dev\.uart\.\([1-9][0-9]*\)\.%pnpinfo$/\1/p'); do
+		# The device tree node, e.g. "name=uart@10003000 compat=ns16550a".
+		node=$(sysctl -n "dev.uart.$unit.%pnpinfo")
+		base=${node#*name=*@}
+		base=${base%% *}
+		case "$base" in
+			''|*[!0-9a-fA-F]*) continue ;;
+		esac
+		[ -c "/dev/cuau$unit" ] || continue
+		# The callout device: it does not wait for a carrier.
+		ln -sf "cuau$unit" "/dev/ttyS$unit"
+		mkdir -p "$TTYS/ttyS$unit"
+		printf '0x%X\n' "$((0x$base))" > "$TTYS/ttyS$unit/iomem_base"
+	done
+}
+
 start() {
 	printf 'Setting up the OC2 high-level API: '
 	setup_ports
+	setup_serial
 	if [ ! -d "$LUA_LIB" ]; then
 		printf 'no %s, skipped\n' "$LUA_LIB"
 		return 0
@@ -65,10 +89,19 @@ start() {
 		mkdir -p /run/oc2
 		env LUA_PATH="$(lua_path)" daemon -r -S -T oc2busd \
 		    -P "$PID_FILE" /usr/bin/lua "$DAEMON"
+		# When memory runs out, the kernel kills the largest process,
+		# often oc2busd, and with it every program's device bus. Keep
+		# it and the supervisor (and so the restarted daemon) out of
+		# that.
+		i=0
+		while [ ! -s "$PID_FILE" ] && [ "$i" -lt 50 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		[ -s "$PID_FILE" ] && protect -d -i -p "$(cat "$PID_FILE")"
 		# Wait until it listens: a program that finds no daemon opens
-		# the ports itself, and on FreeBSD (unlike Linux) the daemon
-		# can still open them too, and the two would read each other's
-		# replies. Starting takes a few seconds on this CPU.
+		# the ports itself, and the daemon could not have them while
+		# it does. Starting takes a few seconds on this CPU.
 		i=0
 		while [ ! -S /run/oc2/bus ] && [ "$i" -lt 600 ]; do
 			sleep 0.1

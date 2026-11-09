@@ -62,6 +62,10 @@ import java.util.Properties;
  *                          the high-level API for that redstone interface
  *                          ("redstone", "door") and a device "test"
  *   --builtin DIR          what the builtin file system holds (default: empty)
+ *   --serial               add a serial interface card: a UART after the other
+ *                          devices, its cable looped back (what the guest
+ *                          sends, it receives); with --oc2 also its
+ *                          high-level API device "serial", address 7
  *   --bootargs STRING      /chosen/bootargs
  *   --send STRING          text to type once WAITFOR has been seen, repeatable;
  *                          "\n" is a newline; "@redstone SIDE LEVEL" instead
@@ -86,6 +90,7 @@ public final class SednaRun {
         final List<String> shares = new ArrayList<>();
         boolean net = false;
         boolean oc2 = false;
+        boolean serial = false;
         String builtinDir = null;
         String bootargs = null;
         final Deque<String> sends = new ArrayDeque<>();
@@ -101,6 +106,7 @@ public final class SednaRun {
                 case "--share" -> shares.add(args[++i]);
                 case "--net" -> net = true;
                 case "--oc2" -> oc2 = true;
+                case "--serial" -> serial = true;
                 case "--builtin" -> builtinDir = args[++i];
                 case "--bootargs" -> bootargs = args[++i];
                 case "--send" -> sends.add(args[++i].replace("\\n", "\n"));
@@ -191,6 +197,18 @@ public final class SednaRun {
             device.getInterrupt().set(irq++, board.getInterruptController());
             board.addDevice(device);
         }
+        // Cards come after the built-in devices, as in OC2.
+        UART16550A serialUart = null;
+        if (serial) {
+            serialUart = new UART16550A();
+            serialUart.getInterrupt().set(irq++, board.getInterruptController());
+            final long base = board.addDevice(serialUart).orElseThrow();
+            if (hlapi != null) {
+                hlapi.serial = serialUart;
+                hlapi.serialBase = base;
+            }
+        }
+        final Deque<Byte> serialLoop = new ArrayDeque<>();
 
         // Firmware at the start of RAM, its region reserved in the device tree.
         final byte[] fw = Files.readAllBytes(new File(firmware).toPath());
@@ -227,6 +245,15 @@ public final class SednaRun {
             board.step(cyclesPerStep);
             if (hlapi != null) {
                 hlapi.pump();
+            }
+            if (serialUart != null) {
+                int b;
+                while ((b = serialUart.read()) >= 0) {
+                    serialLoop.addLast((byte) b);
+                }
+                while (!serialLoop.isEmpty() && serialUart.canPutByte()) {
+                    serialUart.putByte(serialLoop.removeFirst());
+                }
             }
 
             int value;
@@ -586,6 +613,7 @@ public final class SednaRun {
     static final class Hlapi {
         private static final String REDSTONE_ID = "6f1d7c2a-0d8e-4a43-9b61-5c3e2f7a9d10";
         private static final String TEST_ID = "0b7e4d1c-2f3a-4e5b-8c6d-7e8f9a0b1c2d";
+        private static final String SERIAL_ID = "3c9a5e2b-7d1f-4b6a-a8e0-1f2d3c4b5a69";
         private static final List<String> SIDES = List.of("down", "up", "back", "front", "left", "right");
         private static final Map<String, Integer> ABSOLUTE = Map.of("north", 3, "south", 2, "west", 4, "east", 5);
         private static final int MAX_REQUEST = 4096;
@@ -598,6 +626,8 @@ public final class SednaRun {
         private final Deque<String> requests = new ArrayDeque<>();
         private final Deque<Byte> rpcOut = new ArrayDeque<>(), blobOut = new ArrayDeque<>(), eventOut = new ArrayDeque<>();
         private boolean oversized;
+        UART16550A serial;
+        long serialBase;
 
         Hlapi(final VirtIOConsoleDevice console, final Mlapi.Redstone redstone) {
             rpc = console.getPort(0);
@@ -748,9 +778,15 @@ public final class SednaRun {
             blobIn.reset(); // payload bytes not used by this request are discarded
 
             switch (type) {
-                case "list" -> reply("list", id, List.of(
-                    Map.of("deviceId", REDSTONE_ID, "typeNames", List.of("redstone", "door")),
-                    Map.of("deviceId", TEST_ID, "typeNames", List.of("test"))));
+                case "list" -> {
+                    final List<Object> devices = new ArrayList<>(List.of(
+                        Map.of("deviceId", REDSTONE_ID, "typeNames", List.of("redstone", "door")),
+                        Map.of("deviceId", TEST_ID, "typeNames", List.of("test"))));
+                    if (serial != null) {
+                        devices.add(Map.of("deviceId", SERIAL_ID, "typeNames", List.of("serial")));
+                    }
+                    reply("list", id, devices);
+                }
                 case "methods" -> {
                     final Object device = message.get("data");
                     if (REDSTONE_ID.equals(device)) {
@@ -766,6 +802,12 @@ public final class SednaRun {
                             method("echo", "byte[]", "Returns the bytes it was given, as a payload.",
                                 param("data", "byte[]", "the bytes")),
                             method("fail", "void", "Always fails.")));
+                    } else if (SERIAL_ID.equals(device) && serial != null) {
+                        reply("methods", id, List.of(
+                            method("getAddress", "int", "Gets the address this card is set to."),
+                            method("getBaseAddress", "long", "Gets where this card's serial port registers are mapped."),
+                            method("getBaudRate", "int", "Gets the baud rate the serial port is configured to."),
+                            method("getTxErrorCount", "int", "Gets how often sent data was corrupted.")));
                     } else {
                         reply("error", id, "unknown device");
                     }
@@ -852,6 +894,15 @@ public final class SednaRun {
                             queue(blobOut, payload);
                         }
                         case "fail" -> reply("error", id, "java.lang.IllegalStateException: always fails");
+                        default -> reply("error", id, "unknown method");
+                    }
+                } else if (SERIAL_ID.equals(device) && serial != null) {
+                    if (!params.isEmpty()) throw new IllegalArgumentException();
+                    switch (String.valueOf(name)) {
+                        case "getAddress" -> reply("result", id, 7L);
+                        case "getBaseAddress" -> reply("result", id, serialBase);
+                        case "getBaudRate" -> reply("result", id, (long) serial.getBaudRate());
+                        case "getTxErrorCount" -> reply("result", id, 0L);
                         default -> reply("error", id, "unknown method");
                     }
                 } else {

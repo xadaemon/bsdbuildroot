@@ -1,0 +1,127 @@
+stty: add -F, whose settings stay until changed
+
+On Linux, "stty -F /dev/ttyS1 9600 raw" sets up a serial port for the
+programs that open it later. FreeBSD's stty has -f instead, and the
+settings only last while the terminal is open: its first open starts
+from the initial state, the .init device. OpenComputers II's serial
+library and manual use "stty -F" to set up its serial interface card.
+
+Add -F: as -f, and the settings also become the terminal's initial
+state, when it has one.
+
+diff --git a/bin/stty/stty.1 b/bin/stty/stty.1
+index 4f0126dde275..c1a9d7f93992 100644
+--- a/bin/stty/stty.1
++++ b/bin/stty/stty.1
+@@ -38,7 +38,7 @@
+ .Sh SYNOPSIS
+ .Nm
+ .Op Fl a | e | g
+-.Op Fl f Ar file
++.Op Fl f | F Ar file
+ .Op Ar arguments
+ .Sh DESCRIPTION
+ The
+@@ -76,6 +76,19 @@ flag of
+ making it possible to
+ set or display settings on a terminal that might otherwise
+ block on the open.
++.It Fl F
++As
++.Fl f ,
++and the settings also become the initial state of the terminal (its
++.Pa .init
++device, see
++.Xr tty 4 ) ,
++which every first open of the terminal starts with,
++so that they stay until changed, as with Linux's
++.Nm
++.Fl F .
++Terminals without an initial state device only get the settings, as with
++.Fl f .
+ .It Fl g
+ Display all the current settings for the terminal to standard output
+ in a form that may be used as an argument to a subsequent invocation of
+diff --git a/bin/stty/stty.c b/bin/stty/stty.c
+index 38834aaccea0..5e2bd06fb0a9 100644
+--- a/bin/stty/stty.c
++++ b/bin/stty/stty.c
+@@ -41,6 +41,8 @@
+ #include "stty.h"
+ #include "extern.h"
+ 
++static void setinit(const char *, struct termios *);
++
+ int
+ main(int argc, char *argv[])
+ {
+@@ -48,6 +50,7 @@ main(int argc, char *argv[])
+ 	enum FMT fmt;
+ 	int ch;
+ 	const char *file, *errstr = NULL;
++	int initstate = 0;
+ 
+ 	fmt = NOTSET;
+ 	i.fd = STDIN_FILENO;
+@@ -55,8 +58,8 @@ main(int argc, char *argv[])
+ 
+ 	opterr = 0;
+ 	while (optind < argc &&
+-	    strspn(argv[optind], "-aefg") == strlen(argv[optind]) &&
+-	    (ch = getopt(argc, argv, "aef:g")) != -1)
++	    strspn(argv[optind], "-aeFfg") == strlen(argv[optind]) &&
++	    (ch = getopt(argc, argv, "aeF:f:g")) != -1)
+ 		switch(ch) {
+ 		case 'a':		/* undocumented: POSIX compatibility */
+ 			fmt = POSIX;
+@@ -64,6 +67,9 @@ main(int argc, char *argv[])
+ 		case 'e':
+ 			fmt = BSD;
+ 			break;
++		case 'F':
++			initstate = 1;
++			/* FALLTHROUGH */
+ 		case 'f':
+ 			if ((i.fd = open(optarg, O_RDONLY | O_NONBLOCK)) < 0)
+ 				err(1, "%s", optarg);
+@@ -137,16 +143,39 @@ args:	argc -= optind;
+ 
+ 	if (i.set && tcsetattr(i.fd, 0, &i.t) < 0)
+ 		err(1, "tcsetattr");
++	if (i.set && initstate)
++		setinit(file, &i.t);
+ 	if (i.wset && ioctl(i.fd, TIOCSWINSZ, &i.win) < 0)
+ 		warn("TIOCSWINSZ");
+ 	exit(0);
+ }
+ 
++/*
++ * -F: the settings also become the terminal's initial state (its .init
++ * device, see tty(4)), which every first open starts with, so that they
++ * stay until changed, as with Linux's stty -F.
++ */
++static void
++setinit(const char *file, struct termios *t)
++{
++	char path[PATH_MAX], init[PATH_MAX + sizeof(".init")];
++	int fd;
++
++	if (realpath(file, path) == NULL)
++		err(1, "%s", file);
++	(void)snprintf(init, sizeof(init), "%s.init", path);
++	if ((fd = open(init, O_RDONLY | O_NONBLOCK)) < 0)
++		return;		/* No initial state to set. */
++	if (tcsetattr(fd, 0, t) < 0)
++		err(1, "%s", init);
++	(void)close(fd);
++}
++
+ void
+ usage(void)
+ {
+ 
+ 	(void)fprintf(stderr,
+-	    "usage: stty [-a | -e | -g] [-f file] [arguments]\n");
++	    "usage: stty [-a | -e | -g] [-f | -F file] [arguments]\n");
+ 	exit (1);
+ }

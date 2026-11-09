@@ -12,9 +12,10 @@ The disk image is laid out so that sedna-fw finds an ext2 file system while
 FreeBSD gets a UFS root (ext2 leaves its first 1024 bytes unused):
 
 ```
-sector 0      MBR, one FreeBSD (165) partition: the UFS root
+sector 0      MBR, two FreeBSD (165) partitions: the UFS root and the swap
 byte 1024     small ext2 file system with only /boot/Image   (what sedna-fw reads)
 next MiB      UFS2 root, soft updates, label sedna_freebsd   (what FreeBSD mounts)
+last 8 MiB    swap, glabel label sedna_swap
 ```
 
 ## What is in the image
@@ -40,9 +41,12 @@ one hart, no modules, ns16550 console, virtio-mmio block/net/console/9p,
 Goldfish RTC, PLIC, SBI timer, OC2's mid-level API, UFS root mounted by label, ext2fs, tmpfs, DDB.
 
 It runs in OC2's largest configuration, 4 × 8 MB memory: about 25 MB usable
-(`hw.physmem`) after the firmware's 2 MB and the kernel, ~6 MB of it free
-at the login prompt. The disk is 24 MB: 5 MB boot area, 19 MB root with
-~6 MB free.
+(`hw.physmem`) after the firmware's 2 MB, of which the kernel keeps ~9 MB;
+~4 MB is free at the login prompt with oc2busd running. The disk is 32 MB:
+5 MB boot area, 19 MB root with ~6 MB free, and 8 MB swap, so programs that
+sit idle make room for others: about a dozen Lua programs using the
+high-level API run at once next to oc2busd (5 without swap and the kernel
+settings below).
 
 ### Patches to FreeBSD ([`board/sedna-riscv64/patches/freebsd`](board/sedna-riscv64/patches/freebsd))
 
@@ -87,6 +91,15 @@ at the login prompt. The disk is 24 MB: 5 MB boot area, 19 MB root with
     to the device at once, so input beyond the tty's ~2 KB queue was
     dropped. It now holds buffers until the reader makes room, as Linux's
     driver does, so large HLAPI payloads arrive intact.
+13. **virtio-console: one open at a time per port**: as on Linux, a port of
+    a multiport device (not a console port) can only be open once; a second
+    `open()` fails with `EBUSY`, for root too. A new tty flag,
+    `TF_SINGLEOPEN`, does that (`TIOCEXCL` does not keep root out). Two
+    programs on one HLAPI port would read part of each other's replies.
+14. **stty `-F`**: Linux's `stty -F /dev/ttyS1 9600 raw`, which OC2's
+    serial library and manual use. As `-f`, and the settings also become
+    the terminal's initial state (its `.init` device): FreeBSD resets a
+    terminal to that state on every first open, Linux keeps the settings.
 
 The `src` stage commits the patches to a local `sedna` branch, with a fixed
 author and dates, rather than leaving them as changes in the work tree. With
@@ -99,7 +112,16 @@ The kernel configuration also needs `options KTRACE`: without it, 15.1's
 4 MB to 512 KB (`TMPFS_PAGES_MINRESERVED`): tmpfs refuses to create files
 while fewer pages are free, and 4 MB is most of what is free on this
 machine, so `/tmp`, `/var/log` and `/run` failed with "No space left on
-device" as soon as a program or two ran.
+device" as soon as a program or two ran. And it scales down what the kernel
+sets aside at boot, which is wired memory that can't be swapped out
+(13.4 MB of 23.4 MB before, 9 MB now): the buffer cache is capped at 2 MB
+(`kern.nbuf=128`; by default it could grow to 6 MB), I/O buffers are sized
+for 128 KB transfers instead of 1 MB (`kern.maxphys`), and the device event
+queue for `devd(8)`, which does not run, is off (`hw.bus.devctl_queue=0`).
+
+The swap partition is found by its `glabel(8)` label,
+`/dev/label/sedna_swap`, whatever the disk is called; `SWAP_SIZE` in the
+configuration sets its size, empty for none.
 
 ### Not supported yet
 
@@ -113,8 +135,6 @@ device" as soon as a program or two ran.
   Linux image); `touch /etc/mnt_init.builtin` runs them anyway. The 9p file
   system itself is mounted at `/mnt/builtin` as usual, and `S91oc2` does
   what the scripts that matter do: `LUA_PATH`, and starting oc2busd.
-- OC2's `oc2.serial` Lua module (serial interface cards) looks the card up
-  in Linux's `/sys/class/tty`, so it does not work here.
 - The kernel in the boot area can't be updated from FreeBSD; rebuild the
   image instead.
 
@@ -171,7 +191,7 @@ Output in `output/images`:
 
 | File                  | What                                                  |
 |-----------------------|-------------------------------------------------------|
-| `sedna-freebsd.img`   | the disk image (boot area + UFS root); what OC2 boots |
+| `sedna-freebsd.img`   | the disk image (boot area, UFS root, swap); what OC2 boots |
 | `Image`               | the kernel as sedna-fw loads it                       |
 | `kernel`, `kernel.debug` | kernel ELF and its debug info, for gdb             |
 | `firmware.bin`, `firmware.properties` | sedna-fw, if its sources are found (`SEDNA_FW=`, default `../buildroot/boot/sedna-fw/src`, a checkout of [fnuecke/buildroot](https://github.com/fnuecke/buildroot) next to this one). Only for testing; in game OC2's own copy is used |
@@ -238,14 +258,31 @@ lua -e 'r = require("devices"):find("redstone"); r:setRedstoneOutput("up", 15)'
   `/sys/class/virtio-ports`, where OC2's library looks them up as on Linux.
 - `LUA_PATH` (`/etc/profile.d/lua_path.sh`) includes `/mnt/builtin/lib/lua`.
 - `oc2busd`, which shares the ports between programs, runs under
-  `daemon(8)`: restarted if it stops, output in `/var/log/messages`. Boot
-  waits until it listens on `/run/oc2/bus`. It takes about 2.5 MB of
-  memory; `touch /etc/oc2busd.disabled` to not start it, then one program
-  at a time opens the ports itself.
+  `daemon(8)`: restarted if it stops, output in `/var/log/messages`, and
+  `protect(1)`ed, so that when memory runs out the kernel kills other
+  programs rather than the bus every program depends on. Boot
+  waits until it listens on `/run/oc2/bus`. `touch /etc/oc2busd.disabled`
+  to not start it; then one program at a time opens the ports itself.
 
-While oc2busd runs, don't open the ports from another program (e.g. with
-`OC2_BUS_SOCKET=none`): Linux refuses a second open with `EBUSY`, FreeBSD
-lets it happen, and the two programs would read each other's replies.
+A port can only be open once at a time (patch 0013), as on Linux: while
+oc2busd runs, a program that opens the ports itself (e.g. with
+`OC2_BUS_SOCKET=none`) gets `EBUSY` instead of reading part of the daemon's
+replies.
+
+### Serial interface cards
+
+The [serial interface card](https://fnuecke.github.io/oc2/manual/en_us/item/serial_interface_card.html)
+is a 16550 UART, `uart(4)`. `S91oc2` names the cards as on Linux,
+`/dev/ttyS1` for the first (a link to its `cuau` device, which does not
+wait for a carrier; `ttyS0` would be the console), and lists their register
+addresses in `/sys/class/tty/ttyS*/iomem_base`, where OC2's `oc2.serial`
+library tells the cards apart. The manual's commands work, with `stty -F`
+(patch 0014), whose settings stay until changed:
+
+```sh
+stty -F /dev/ttyS1 9600 raw -echo -crtscts
+lua -e 'l = assert(require("oc2.serial").open(nil, 9600)); l:broadcast("hello")'
+```
 
 ### Mid-level API
 
@@ -289,6 +326,8 @@ and a redstone interface (`REDSTN`, labelled `door`). In scripted runs, a
 receives, to test events. The RPC console answers the high-level API for the
 same redstone interface (`redstone`, `door`) and a `test` device (`echo` returns
 a binary payload, `fail` fails); `SEDNARUN_HLAPI_DEBUG=1` logs the messages.
+`--serial` adds a serial interface card whose cable is looped back (what the
+machine sends, it receives), and with `--oc2` its `serial` HLAPI device.
 Point `--builtin` at OC2's scripts (`common/src/main/scripts` in its
 sources; the files in `bin` need to be executable) to run its libraries.
 Pass them with `ARGS="--oc2 --builtin DIR"`.

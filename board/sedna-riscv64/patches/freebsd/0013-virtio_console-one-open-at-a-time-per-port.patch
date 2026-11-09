@@ -1,0 +1,72 @@
+virtio_console: one open at a time per port
+
+On Linux, the ports of a multiport virtio console, except console ports,
+are character devices that only one file may have open at a time; a
+second open fails with EBUSY. Protocols over the ports rely on that:
+OpenComputers II's bus daemon owns its ports, and a program that opens
+them as well would read part of the daemon's replies, and the daemon
+part of the program's. Here they are ttys, which any number of files can
+open, and TF_EXCLUDE (TIOCEXCL) does not keep out root.
+
+Add a tty flag, TF_SINGLEOPEN, that makes opening a tty that is already
+open fail with EBUSY, for everyone, and set it on the ports of multiport
+devices; a CONSOLE_PORT message clears it, so console ports stay
+terminals.
+
+diff --git a/sys/dev/virtio/console/virtio_console.c b/sys/dev/virtio/console/virtio_console.c
+index 6d99aec396e2..e23792dec186 100644
+--- a/sys/dev/virtio/console/virtio_console.c
++++ b/sys/dev/virtio/console/virtio_console.c
+@@ -826,6 +826,7 @@ vtcon_ctrl_port_console_event(struct vtcon_softc *sc, int id)
+ 	VTCON_PORT_LOCK(port);
+ 	VTCON_UNLOCK(sc);
+ 	port->vtcport_flags |= VTCON_PORT_FLAG_CONSOLE;
++	port->vtcport_tty->t_flags &= ~TF_SINGLEOPEN;
+ 	vtcon_port_submit_event(port, VIRTIO_CONSOLE_PORT_OPEN, 1);
+ 	VTCON_PORT_UNLOCK(port);
+ }
+@@ -1185,6 +1186,15 @@ vtcon_port_create(struct vtcon_softc *sc, int id)
+ 	mtx_init(&port->vtcport_mtx, "vtcpmtx", NULL, MTX_DEF);
+ 	port->vtcport_tty = tty_alloc_mutex(&vtcon_tty_class, port,
+ 	    &port->vtcport_mtx);
++	/*
++	 * As on Linux, where every port of a multiport device but a console
++	 * port is a character device only one file may have open at a time:
++	 * the ports carry protocols, and two readers would each get part of
++	 * the other's messages. The device makes a port a console port, a
++	 * terminal like any other, with a CONSOLE_PORT message.
++	 */
++	if (sc->vtcon_flags & VTCON_FLAG_MULTIPORT)
++		port->vtcport_tty->t_flags |= TF_SINGLEOPEN;
+ 
+ 	error = vtcon_port_init_vqs(port);
+ 	if (error) {
+diff --git a/sys/kern/tty.c b/sys/kern/tty.c
+index 430a0e06c34e..f7381199cfc0 100644
+--- a/sys/kern/tty.c
++++ b/sys/kern/tty.c
+@@ -314,6 +314,12 @@ ttydev_open(struct cdev *dev, int oflags, int devtype __unused,
+ 		goto done;
+ 	}
+ 
++	/* A device that only one file may have open at a time. */
++	if (tp->t_flags & TF_SINGLEOPEN && tty_opened(tp)) {
++		error = EBUSY;
++		goto done;
++	}
++
+ 	if (!tty_opened(tp)) {
+ 		/* Set proper termios flags. */
+ 		if (TTY_CALLOUT(tp, dev))
+diff --git a/sys/sys/tty.h b/sys/sys/tty.h
+index f1b2646c942d..c2ed073d06b6 100644
+--- a/sys/sys/tty.h
++++ b/sys/sys/tty.h
+@@ -87,6 +87,7 @@ struct tty {
+ #define	TF_BUSY_IN	0x20000	/* Process busy in read() -- not supported. */
+ #define	TF_BUSY_OUT	0x40000	/* Process busy in write(). */
+ #define	TF_BUSY		(TF_BUSY_IN|TF_BUSY_OUT)
++#define	TF_SINGLEOPEN	0x80000	/* Opened by one file at a time, even root. */
+ 	unsigned int	t_revokecnt;	/* (t) revoke() count. */
+ 
+ 	/* Buffering mechanisms. */

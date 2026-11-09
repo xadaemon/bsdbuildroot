@@ -107,6 +107,7 @@ usr/bin/nc
 usr/bin/od
 usr/bin/passwd
 usr/bin/printf
+usr/bin/protect
 usr/bin/readlink
 usr/bin/reset
 usr/bin/seq

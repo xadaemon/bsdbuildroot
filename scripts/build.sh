@@ -271,6 +271,10 @@ stage_rootfs() {
 	*) die "TARGET_HOSTNAME_FROM_MAC must be yes or no" ;;
 	esac
 	printf '%s\n' "$TARGET_ISSUE" > "$t/etc/issue"
+	if [ -n "$SWAP_SIZE" ]; then
+		printf '/dev/label/%s\t\tnone\t\tswap\tsw\t\t0\t0\n' \
+		    "$SWAP_LABEL" >> "$t/etc/fstab"
+	fi
 
 	# mlapi(1), OC2's mid-level API from the shell, against the world just
 	# installed. The host's clang cross compiles.
@@ -338,6 +342,13 @@ to_bytes() {
 	esac
 }
 
+# Writes MBR partition table entry INDEX (0-3) of $img.tmp: FreeBSD (165),
+# at byte OFFSET, SIZE bytes.
+mbr_entry() {
+	printf "\\000\\376\\377\\377\\245\\376\\377\\377$(le32 $(($2 / 512)))$(le32 $(($3 / 512)))" |
+	    dd of="$img.tmp" bs=1 seek=$((446 + $1 * 16)) conv=notrunc 2>/dev/null
+}
+
 # Prints a 32 bit little endian value as printf(1) octal escapes.
 le32() {
 	printf '\\%03o\\%03o\\%03o\\%03o' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) \
@@ -357,14 +368,16 @@ make_disk() {
 		# rebuilt with every kernel, so no room for a larger kernel.
 		boot_bytes=$(( (image_bytes + mib / 2 + mib - 1) / mib * mib ))
 	fi
-	root_bytes=$((disk_bytes - boot_bytes))
+	swap_bytes=0
+	[ -z "$SWAP_SIZE" ] || swap_bytes=$(to_bytes "$SWAP_SIZE")
+	root_bytes=$((disk_bytes - boot_bytes - swap_bytes))
 	[ "$root_bytes" -gt 0 ] || die "DISK_SIZE $DISK_SIZE leaves no room for /"
 
 	img="$IMAGES/sedna-freebsd.img"
 	bootdir="$WORK/bootfs"
 	used=$(du -skA "$TARGET_DIR" | awk '{ print $1 }')
 	msg "Making $img: $DISK_SIZE, boot $((boot_bytes / 1024))K," \
-	    "root $((root_bytes / 1024))K (${used}K used)"
+	    "root $((root_bytes / 1024))K (${used}K used), swap $((swap_bytes / 1024))K"
 
 	# The boot area. As buildroot's fs/ext2, which is what sedna-fw reads:
 	# revision 1, ext2, no 64bit, 128 byte inodes. Ownership does not matter,
@@ -390,11 +403,25 @@ make_disk() {
 
 	cat "$WORK/boot.ext2" "$WORK/root.ufs" > "$img.tmp"
 
-	# MBR, written last: mke2fs clears the first sector. One FreeBSD (165)
-	# partition, the root file system; the boot area before it is unused
-	# space as far as partitioning goes.
-	entry="\\000\\376\\377\\377\\245\\376\\377\\377$(le32 $((boot_bytes / 512)))$(le32 $((root_bytes / 512)))"
-	printf "$entry" | dd of="$img.tmp" bs=1 seek=446 conv=notrunc 2>/dev/null
+	# MBR, written last: mke2fs clears the first sector. A FreeBSD (165)
+	# partition for the root file system, and one for the swap space; the
+	# boot area before them is unused space as far as partitioning goes.
+	mbr_entry 0 "$boot_bytes" "$root_bytes"
+	if [ "$swap_bytes" -gt 0 ]; then
+		truncate -s "$disk_bytes" "$img.tmp"
+		mbr_entry 1 $((boot_bytes + root_bytes)) "$swap_bytes"
+		# A glabel(8) label in the last sector of the swap partition, so
+		# fstab finds it as /dev/label/<name> whatever the disk is called.
+		# struct g_label_metadata: magic, version 2, name, provider size.
+		{
+			printf 'GEOM::LABEL\000\000\000\000\000'
+			printf "$(le32 2)"
+			printf '%s' "$SWAP_LABEL"
+			head -c $((16 - ${#SWAP_LABEL})) /dev/zero
+			printf "$(le32 $((swap_bytes & 0xffffffff)))$(le32 $((swap_bytes >> 32)))"
+		} | dd of="$img.tmp" bs=512 seek=$((disk_bytes / 512 - 1)) \
+		    conv=notrunc 2>/dev/null
+	fi
 	printf '\125\252' | dd of="$img.tmp" bs=1 seek=510 conv=notrunc 2>/dev/null
 	magic=$(od -An -tx1 -j1080 -N2 "$img.tmp" | tr -d ' ')
 	[ "$magic" = "53ef" ] || die "the MBR clobbered the ext2 superblock"
