@@ -262,6 +262,14 @@ stage_rootfs() {
 	    > "$WORK/overlay.files"
 
 	printf '%s\n' "$TARGET_HOSTNAME" > "$t/etc/hostname"
+	case "$TARGET_HOSTNAME_FROM_MAC" in
+	yes)
+		msg "Hostname from the NIC's MAC (TARGET_HOSTNAME_FROM_MAC)"
+		cp -R "$TOP/$BOARD_DIR/hostname-from-mac/." "$t/"
+		;;
+	no) ;;
+	*) die "TARGET_HOSTNAME_FROM_MAC must be yes or no" ;;
+	esac
 	printf '%s\n' "$TARGET_ISSUE" > "$t/etc/issue"
 
 	if [ -n "$ROOTFS_POST_BUILD_SCRIPT" ]; then

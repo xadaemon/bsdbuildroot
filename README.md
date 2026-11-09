@@ -28,6 +28,7 @@ next MiB      UFS2 root, soft updates, label sedna_freebsd   (what FreeBSD mount
 | busybox init + `/etc/init.d/rcS`   | `init(8)` + a small `/etc/rc` running `/etc/rc.d/S??*`  |
 | getty + login, root without password | the same: getty + `login(1)` (PAM), root without password; `su`, `passwd`, `pw` work |
 | busybox syslogd, `/var/log` in RAM | `syslogd(8)`, `/var/log` on tmpfs                       |
+| hostname `sedna-xxxxxx` from the NIC's MAC (`S01hostname`) | `localhost`; the Linux behaviour with `TARGET_HOSTNAME_FROM_MAC="yes"`, see [Configuration](#configuration) |
 | `S90virtio9p`, `S99mnt_init`       | same scripts, using `p9fs(4)`                           |
 | Lua 5.4                            | `lua` (FreeBSD's `flua`, core library plus `posix`)     |
 | nano                               | `ee`                                                    |
@@ -125,6 +126,22 @@ pkg install git e2fsprogs-core
 (`scripts/build.sh` also looks in `~/.local/bin`, so e2fsprogs can be
 unpacked there without root.)
 
+### Configuration
+
+Build settings are in [`configs/sedna-riscv64.conf`](configs/sedna-riscv64.conf):
+the FreeBSD branch, kernel configuration, disk size and layout, and:
+
+- `TARGET_HOSTNAME`: the hostname, `localhost` by default.
+- `TARGET_HOSTNAME_FROM_MAC`: `yes` gives the Linux image's behaviour: a
+  machine still called `localhost` at boot is renamed after its network
+  card's MAC address (`sedna-` and its last six hex digits), and the name is
+  written to `/etc/hostname`, so it sticks, also if the card is changed
+  later. That gives every computer a distinct name without setting one by
+  hand. It only applies while `TARGET_HOSTNAME` is `localhost`. `no` (the
+  default) keeps `TARGET_HOSTNAME`. The script it adds is
+  [`board/sedna-riscv64/hostname-from-mac`](board/sedna-riscv64/hostname-from-mac).
+- `TARGET_ISSUE`: the banner shown above the login prompt.
+
 Output in `output/images`:
 
 | File                  | What                                                  |
@@ -144,6 +161,7 @@ Output in `output/images`:
 | [`board/sedna-riscv64/src.conf`](board/sedna-riscv64/src.conf) | (toolchain/world options) |
 | [`board/sedna-riscv64/patches/freebsd`](board/sedna-riscv64/patches/freebsd) | `board/sedna-riscv64/patches/linux` |
 | [`board/sedna-riscv64/rootfs-overlay`](board/sedna-riscv64/rootfs-overlay) | `board/sedna-riscv64/rootfs-overlay` |
+| [`board/sedna-riscv64/hostname-from-mac`](board/sedna-riscv64/hostname-from-mac) | its `etc/init.d/S01hostname`, optional here |
 | [`board/sedna-riscv64/post-build.sh`](board/sedna-riscv64/post-build.sh) | `board/sedna-riscv64/post-build.sh` |
 | [`scripts/build.sh`](scripts/build.sh) | buildroot's `make` |
 | [`datapack`](datapack) | (the OC2 data pack around the image) |
