@@ -1,0 +1,47 @@
+{
+  "neoforge:conditions": [
+    {
+      "type": "neoforge:item_exists",
+      "item": "oc2:cpu_ppc64le"
+    }
+  ],
+  "fabric:load_conditions": [
+    {
+      "condition": "fabric:registry_contains",
+      "registry": "minecraft:item",
+      "values": [
+        "oc2:cpu_ppc64le"
+      ]
+    }
+  ],
+  "parent": "minecraft:recipes/root",
+  "criteria": {
+    "has_cpu_ppc64le": {
+      "conditions": {
+        "items": [
+          {
+            "items": "oc2:cpu_ppc64le"
+          }
+        ]
+      },
+      "trigger": "minecraft:inventory_changed"
+    },
+    "has_the_recipe": {
+      "conditions": {
+        "recipe": "power_bsd:hard_drive_colossal_freebsd"
+      },
+      "trigger": "minecraft:recipe_unlocked"
+    }
+  },
+  "requirements": [
+    [
+      "has_the_recipe",
+      "has_cpu_ppc64le"
+    ]
+  ],
+  "rewards": {
+    "recipes": [
+      "power_bsd:hard_drive_colossal_freebsd"
+    ]
+  }
+}

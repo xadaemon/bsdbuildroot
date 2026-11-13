@@ -1,0 +1,3 @@
+# Sourced by dhclient-script(8). The image has no resolvconf(8): write the
+# name servers from the lease to /etc/resolv.conf directly.
+resolvconf_enable=NO

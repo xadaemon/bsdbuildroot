@@ -1,0 +1,122 @@
+#!/bin/sh
+#
+# OpenComputers II's high-level API (HLAPI) on the tier 5 computer: sets the
+# system up so that OC2's own Lua libraries (require("devices"), lsdev.lua,
+# ...) and its bus daemon run unchanged, as they do on OC2's Linux image.
+# This machine has no /mnt/builtin to bring them: the image has them in
+# /usr/share/flua and /usr/bin.
+#
+#  - The HLAPI is on three more consoles of the machine, which the device
+#    tree labels oc2.rpc.0, oc2.blob.0 and oc2.event.0. On FreeBSD every
+#    console is a uart(4), /dev/cuauN, numbered in the order of the device
+#    tree, not of their names: look them up by label, make them raw, and list
+#    them like Linux's /sys/class/virtio-ports, where the libraries look the
+#    ports up on the RISC-V computers.
+#  - Serial interface cards are consoles too, labelled oc2.serial.0 and up.
+#    They are named as on Linux, /dev/ttyS1 for the first (ttyS0 would be the
+#    console), and their unit addresses are listed in /sys/class/tty, where
+#    OC2's oc2.serial tells the cards apart.
+#  - oc2busd, which shares the ports between programs, is started next
+#    (/etc/rc.d/oc2busd).
+#
+
+# PROVIDE: oc2ports
+# REQUIRE: FILESYSTEMS
+# BEFORE: DAEMON
+# KEYWORD: nojail
+
+. /etc/rc.subr
+
+name="oc2ports"
+desc="Set up the consoles of OC2's high-level API and serial cards"
+start_cmd="oc2ports_start"
+stop_cmd=":"
+
+PORTS="/sys/class/virtio-ports"
+TTYS="/sys/class/tty"
+
+# The machine's labelled consoles, one per line: the unit of its uart(4), the
+# label and the unit address of its device tree node (vty@<address>).
+# ofwdump lists the nodes in the order the kernel numbered the devices in.
+consoles() {
+	ofwdump -p -r /vdevice 2>/dev/null | awk -v quote="'" '
+	function done() {
+		if (vty && label != "")
+			print unit, label, reg
+	}
+	/^ *Node 0x[0-9a-f]+: / {
+		done()
+		vty = ($3 == "vty" || $3 ~ /^vty@/)
+		if (vty)
+			unit++
+		property = label = reg = ""
+		next
+	}
+	/^ *[^ ]+:$/ {
+		property = $1
+		next
+	}
+	# A value: its bytes in hex, then as text between quotes if it is one.
+	vty && property == "label:" && index($0, quote) {
+		label = $0
+		gsub(quote, "", label)
+		gsub(/^ +| +$/, "", label)
+	}
+	vty && property == "reg:" && reg == "" && /^ *([0-9a-f][0-9a-f] ?)+$/ {
+		reg = $0
+		gsub(/ /, "", reg)
+	}
+	BEGIN { unit = -1 }
+	END { done() }'
+}
+
+# Raw, for every program that opens it: a terminal starts each first open
+# with the settings of its .init device. At 115200 baud, the fastest the
+# kernel takes, for the size of the input queue that comes with it: what the
+# host sends in one go has to fit in it.
+raw() {
+	for tty in "cuau$1" "ttyu$1"; do
+		stty -f "/dev/$tty.init" raw -echo -ixon -ixoff "${2:-9600}"
+		stty -f "/dev/$tty" raw -echo -ixon -ixoff "${2:-9600}" 2>/dev/null
+	done
+}
+
+setup_consoles() {
+	rm -rf "$PORTS" "$TTYS"
+	mkdir -p "$PORTS"
+	consoles | while read -r unit label reg; do
+		# The callout device: it does not wait for a carrier.
+		[ -c "/dev/cuau$unit" ] || continue
+		case "$label" in
+		oc2.rpc.*|oc2.blob.*|oc2.event.*)
+			raw "$unit" 115200
+			mkdir -p "$PORTS/cuau$unit"
+			echo "$label" > "$PORTS/cuau$unit/name"
+			;;
+		oc2.serial.*)
+			n=${label##*.}
+			case "$n" in
+				''|*[!0-9]*) continue ;;
+			esac
+			# The line runs at 9600 baud, whatever is set here.
+			raw "$unit"
+			n=$((n + 1))
+			ln -sf "cuau$unit" "/dev/ttyS$n"
+			mkdir -p "$TTYS/ttyS$n"
+			printf '0x%X\n' "$((0x${reg:-0}))" > "$TTYS/ttyS$n/iomem_base"
+			;;
+		esac
+	done
+}
+
+oc2ports_start()
+{
+	local found
+	setup_consoles
+	found=$(cat "$PORTS"/*/name 2>/dev/null | tr '\n' ' ')
+	[ -z "$found" ] || startmsg "OC2 high-level API: $found"
+}
+
+load_rc_config $name
+oc2ports_svcj="NO"
+run_rc_command "$1"

@@ -1,0 +1,31 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "BSD-2-Clause"
+
+[[mods]]
+modId = "power_bsd"
+version = "${version}"
+displayName = "Power BSD"
+authors = "Matheus Xavier"
+description = '''
+FreeBSD for OpenComputers II's tier 5 (PowerPC) computer: the stock FreeBSD release, installed on a bootable hard drive image, as a data pack in every world. The version is the FreeBSD release on the image and the image's build number.
+'''
+# Server side: OC2 sends the drive list to clients, so clients without this
+# mod can join a server that has it.
+displayTest = "IGNORE_ALL_VERSION"
+
+[[dependencies.power_bsd]]
+modId = "minecraft"
+type = "required"
+versionRange = "[${minecraftVersion}]"
+ordering = "NONE"
+side = "BOTH"
+
+# Any OC2 version. Without the PowerPC computer, the drive is still there,
+# but nothing boots it, and the recipe is left out.
+[[dependencies.power_bsd]]
+modId = "oc2"
+type = "required"
+versionRange = "[0,)"
+ordering = "NONE"
+side = "BOTH"

@@ -1,0 +1,23 @@
+{
+    "schemaVersion": 1,
+    "id": "sedna_freebsd",
+    "version": "${version}",
+    "name": "Sedna FreeBSD",
+    "description": "FreeBSD for OpenComputers II: a bootable hard drive image, as a data pack in every world. The version is the FreeBSD release on the image and the image's build number.",
+    "authors": [
+        "Matheus Xavier"
+    ],
+    "license": "BSD-2-Clause",
+    "environment": "*",
+    "entrypoints": {
+        "main": [
+            "sedna_freebsd.fabric.SednaFreeBSDFabric"
+        ]
+    },
+    "depends": {
+        "fabricloader": ">=0.15.0",
+        "minecraft": "${minecraftVersion}",
+        "fabric-resource-loader-v0": "*",
+        "oc2": "*"
+    }
+}

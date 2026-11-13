@@ -1,0 +1,136 @@
+Getting started with Power BSD
+==============================
+
+This is FreeBSD 15.1 for 64-bit PowerPC (powerpc64le) on OpenComputers II's
+tier 5 computer. The kernel and the programs are FreeBSD's own release,
+unchanged: a small part of it, about 150 programs, installed on a 64 MB
+drive with ~17 MB free on /. With them come OC2's own libraries for its
+devices. Read this file with `less` (q quits).
+
+The basics
+----------
+  passwd                  root has no password; set one
+  ee FILE, vi FILE        edit a file (ee: Esc opens the menu)
+  less FILE               read a file
+  top, ps aux, df -h      what runs, and how full the disks are
+  poweroff, reboot        shut down cleanly
+
+Shut down with poweroff before you stop the computer. Its power button,
+breaking it, and the world being saved and loaded again all cut the power
+without a shutdown: the machine starts over from its firmware, and the
+file system is checked and repaired at the next boot.
+
+The console
+-----------
+The console is the computer's serial port, at 9600 baud: about a thousand
+characters a second, so long listings take a while. The terminal type is
+screen.
+
+OpenComputers devices
+---------------------
+Devices on the computer's bus, and cards with a device, are used from Lua
+(the `lua` command) through OC2's high-level API, as in OC2's manual:
+
+  lsdev.lua               list the devices and their type names
+  redstone.lua up 15      OC2's example: set a redstone interface's output
+  lua                     an interactive Lua prompt; try:
+                            d = require("devices")
+                            r = d:find("redstone")
+                            r                       (shows its methods)
+                            r:setRedstoneOutput("up", 15)
+  import.lua, export.lua  copy a file from or to your own computer, with a
+                          file import/export card
+
+OC2's bus daemon, oc2busd, shares the bus between programs; it logs to
+/var/log/messages. sysrc oc2busd_enable=NO to not start it at boot: then
+one program at a time uses the bus.
+
+The mid-level API, from the shell
+---------------------------------
+  mlapi list              devices on the mid-level API
+  mlapi call REDSTN 3 1 15
+                          call a function (here: redstone output up, 15)
+  mlapi events            wait for events
+
+OC2's manual lists every device's functions. The registers are a PCI
+device of the machine (pciconf -lv: none0@pci0:0:31:0), so root only.
+
+Serial interface cards
+----------------------
+Every card is one more serial line, the first /dev/ttyS1, the second
+/dev/ttyS2. They are raw already, and always run at 9600 baud:
+
+  echo hello > /dev/ttyS1
+  lua -e 'l = assert(require("oc2.serial").open()); l:broadcast("hello")'
+
+Processors and memory
+---------------------
+Each PowerPC processor installed is a processor core, up to four; each
+64 MB memory module gives the machine 256 MB:
+
+  sysctl hw.ncpu hw.physmem
+
+More hard drives
+----------------
+The drives are SCSI disks: da0 is the one FreeBSD runs from, the others
+follow in slot order.
+
+  initdisks               list the other drives and what is on them
+  initdisks -a            set up every blank drive (mounted at /mnt/diskN)
+  initdisks da1 games     one drive, mounted at /mnt/games
+
+Set-up drives are mounted at boot, also in other computers (a Sedna
+FreeBSD computer mounts them too).
+
+One volume over several drives
+------------------------------
+gstripe makes one large volume of several drives, striped (RAID 0): it
+is as large as the drives together, and lost if one of them is.
+
+  gstripe label data da1 da2 da3
+                          the volume "data", of three drives
+  newfs -U /dev/stripe/data
+                          a file system on it
+  mountdisks              mount it, at /mnt/data; done at every boot too
+
+  gstripe status          the volumes and their drives
+  umount /mnt/data; gstripe stop data; gstripe clear da1 da2 da3
+                          take the volume apart again
+
+Use drives of one size: each gives as much as the smallest. Give the file
+system no label of its own (newfs -L): the volume has a name already, and
+the kernel then takes one drive for a labelled disk and says so often.
+The drives may change slots, but only a Power BSD computer puts the volume
+together: all of its drives have to be in it.
+
+Kernel modules
+--------------
+  kldstat                 the modules loaded
+  kldload NAME            load one, kldunload NAME to unload it
+
+kld_list in /etc/rc.conf names the modules loaded at boot. The image comes
+with one, geom_stripe (gstripe needs it); others, from FreeBSD 15.1 for
+powerpc64le, go in /boot/kernel.
+
+Starting things at boot
+-----------------------
+The system starts as FreeBSD does, with rc(8): /etc/rc.conf says what is
+started, the scripts in /etc/rc.d do it.
+
+  service -e              what is started at boot
+  service cron stop       stop, start, restart, status: one of them now
+  sysrc -a                the settings in /etc/rc.conf
+  sysrc cron_enable=NO    change one; it counts from the next boot
+  sysrc hostname=myhost   the host name, localhost as it comes
+
+Not every script of FreeBSD is here, only those of what the image has
+(service -l). To run commands of your own at every boot, put them in
+/etc/rc.local, and in /etc/rc.shutdown.local for the shutdown.
+
+Logs are in /var/log, which is kept in memory: 1 MB, gone after a restart.
+cron turns them over every hour once they are large; /etc/crontab is
+where more jobs go.
+
+Installing or removing a card, a drive, memory or a processor makes the
+running computer start over from its firmware, like the power button:
+shut down first.

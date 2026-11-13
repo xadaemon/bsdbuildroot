@@ -1,0 +1,44 @@
+{
+  "neoforge:conditions": [
+    {
+      "type": "neoforge:item_exists",
+      "item": "oc2:hard_drive_colossal"
+    }
+  ],
+  "fabric:load_conditions": [
+    {
+      "condition": "fabric:registry_contains",
+      "registry": "minecraft:item",
+      "values": [
+        "oc2:hard_drive_colossal"
+      ]
+    }
+  ],
+  "type": "oc2:tool",
+  "category": "misc",
+  "ingredients": [
+    {
+      "item": "oc2:hard_drive_colossal"
+    },
+    {
+      "item": "oc2:cpu_riscv"
+    },
+    {
+      "tag": "c:dyes/red"
+    }
+  ],
+  "result": {
+    "components": {
+      "minecraft:custom_data": {
+        "oc2": {
+          "image": "sedna_freebsd:block_devices/hdd/freebsd.bin"
+        }
+      },
+      "minecraft:dyed_color": {
+        "rgb": 11546150
+      }
+    },
+    "count": 1,
+    "id": "oc2:hard_drive_colossal"
+  }
+}

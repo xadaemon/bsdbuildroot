@@ -1,0 +1,118 @@
+#!/bin/sh
+#
+# mountdisks: mounts the machine's other disks: every UFS file system with a
+# volume label, as initdisks(8) makes them, at /mnt/<label>, checked first
+# (OC2 computers are often just switched off). A disk moved here from another
+# computer is mounted too. The root file system and disks /etc/fstab lists
+# are left alone.
+#
+# Striped volumes (gstripe(8), where the image has it) are mounted too, by
+# their own names: /dev/stripe/<name> at /mnt/<name>.
+#
+#   mountdisks       mount what is not mounted yet; run at every boot
+#   mountdisks -u    unmount them
+#
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+# A file system on a striped volume also shows up on one of the volume's
+# disks: on the one that has its superblock, and GEOM does not check that the
+# rest is there. Checking and mounting that one damages the volume, so the
+# labels of such disks are never used.
+#
+# The UFS labels GEOM found on a striped volume or on one of its disks.
+striped_labels() {
+	sysctl -n kern.geom.conftxt | awk '
+	    function flush(  i) {
+		if (striped)
+			for (i = 0; i < n; i++)
+				print label[i]
+		n = striped = 0
+	    }
+	    $1 == 0 { flush() }
+	    $2 == "STRIPE" { striped = 1 }
+	    $2 == "LABEL" && $3 ~ /^ufs\// { label[n++] = substr($3, 5) }
+	    END { flush() }'
+}
+
+# One disk of a striped volume, also where nothing puts the volume together
+# (no geom_stripe in the kernel, a disk missing): gstripe's mark is in its
+# last sector.
+stripe_member() {
+	set -- "$1" $(sysctl -n kern.geom.conftxt |
+	    awk -v name="${1#/dev/}" '$3 == name { print $4, $5; exit }')
+	[ $# -eq 3 ] && [ "$(dd if="$1" bs="$3" skip=$(($2 / $3 - 1)) count=1 \
+	    2>/dev/null | LC_ALL=C head -c 12)" = "GEOM::STRIPE" ]
+}
+
+in_fstab() {
+	grep -q "^[[:space:]]*$1[[:space:]]" /etc/fstab
+}
+
+# The devices to mount, each at /mnt/<its last component>.
+devices() {
+	root=$(mount -p | awk '$2 == "/" { print $1 }')
+	striped=$(striped_labels)
+	for dev in /dev/ufs/*; do
+		[ -e "$dev" ] || continue
+		[ "$dev" = "$root" ] && continue
+		in_fstab "$dev" && continue
+		label=${dev#/dev/ufs/}
+		# /mnt/builtin is OC2's file system on the RISC-V computers.
+		[ "$label" = builtin ] && continue
+		echo "$striped" | grep -qx "$label" && continue
+		stripe_member "$dev" && continue
+		echo "$dev"
+	done
+	for dev in /dev/stripe/*; do
+		[ -e "$dev" ] || continue
+		in_fstab "$dev" && continue
+		[ "${dev#/dev/stripe/}" = builtin ] && continue
+		# Without a file system yet: newfs -U /dev/stripe/<name>.
+		tunefs -p "$dev" >/dev/null 2>&1 || continue
+		echo "$dev"
+	done
+}
+
+mounted() {
+	mount -p | awk -v dev="$1" '$1 == dev { found = 1 } END { exit !found }'
+}
+
+start() {
+	todo=
+	for dev in $(devices); do
+		mounted "$dev" || todo="$todo $dev"
+	done
+	[ -n "$todo" ] || return 0
+	printf 'Mounting disks:'
+	for dev in $todo; do
+		name=${dev##*/}
+		printf ' %s' "$name"
+		if ! fsck_ufs -p "$dev" >/dev/null 2>&1 &&
+		    ! fsck_ufs -y "$dev" >/dev/null 2>&1; then
+			printf ' (fsck failed, not mounted)'
+			continue
+		fi
+		mkdir -p "/mnt/$name" &&
+		    mount -t ufs "$dev" "/mnt/$name" 2>/dev/null ||
+		    printf ' (mount failed)'
+	done
+	printf '\n'
+}
+
+stop() {
+	for dev in $(devices); do
+		mounted "$dev" && umount "$dev"
+	done
+	return 0
+}
+
+case "${1:-}" in
+	'')
+		start ;;
+	-u)
+		stop ;;
+	*)
+		echo "usage: mountdisks [-u]" >&2
+		exit 1 ;;
+esac

@@ -1,0 +1,76 @@
+#!/bin/sh
+#
+# OC2's bus daemon, which shares the high-level API's ports between
+# programs, like S25oc2busd of OC2's Linux image: under daemon(8), which
+# restarts it if it stops and sends its output to syslog. Without it
+# (oc2busd_enable="NO"), programs open the ports directly, one at a time.
+#
+
+# PROVIDE: oc2busd
+# REQUIRE: oc2ports syslogd
+# BEFORE: LOGIN
+# KEYWORD: nojail shutdown
+
+. /etc/rc.subr
+
+name="oc2busd"
+desc="OC2 device bus daemon"
+rcvar="oc2busd_enable"
+# In /run, with the daemon's socket (/run/oc2/bus).
+pidfile="/run/oc2busd.pid"
+command="/usr/sbin/daemon"
+command_args="-r -S -T oc2busd -P ${pidfile} /usr/bin/lua /usr/bin/oc2busd.lua"
+start_precmd="oc2busd_prestart"
+start_postcmd="oc2busd_poststart"
+
+# The device bus's ports, as oc2ports listed them.
+oc2busd_bus()
+{
+	local _port
+	for _port in /sys/class/virtio-ports/*/name; do
+		[ -f "$_port" ] && [ "$(cat "$_port")" = oc2.rpc.0 ] && return 0
+	done
+	return 1
+}
+
+oc2busd_prestart()
+{
+	mkdir -p /run/oc2
+}
+
+oc2busd_nobus()
+{
+	echo "No OC2 device bus: oc2busd not started."
+}
+
+# Wait until it listens: a program that finds no daemon opens the ports
+# itself, and would read part of the daemon's replies once that runs.
+oc2busd_poststart()
+{
+	local i
+	i=0
+	while [ ! -S /run/oc2/bus ] && [ "$i" -lt 300 ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	[ -S /run/oc2/bus ] || warn "oc2busd is not listening yet"
+}
+
+load_rc_config $name
+: ${oc2busd_enable:="YES"}
+# When memory runs out, the kernel kills other programs rather than the bus
+# every program depends on: protect(1), the daemon and what it starts.
+: ${oc2busd_oomprotect:="ALL"}
+oc2busd_svcj="NO"
+# Nothing to start without a device bus, and nothing wrong with that.
+case "$1" in
+*start)
+	if ! oc2busd_bus; then
+		start_cmd="oc2busd_nobus"
+		start_precmd=""
+		start_postcmd=""
+		oc2busd_oomprotect=""
+	fi
+	;;
+esac
+run_rc_command "$1"

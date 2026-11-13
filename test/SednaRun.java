@@ -53,6 +53,9 @@ import java.util.Properties;
  *   --disk FILE            a virtio block device, repeatable, order is DT order
  *   --share DIR:TAG        a virtio 9p file system
  *   --net                  add a (disconnected) virtio network device
+ *   --dhcp                 --net, with a DHCP server on its cable, like a home
+ *                          router's: offers 10.0.2.15/24, router and name
+ *                          server 10.0.2.2, which also answers ARP and ping
  *   --oc2                  add OC2's built-in devices, on OC2's interrupts: two
  *                          Goldfish RTCs, the RPC virtio console (3 ports),
  *                          a 9p file system tagged "builtin", and the
@@ -89,6 +92,7 @@ public final class SednaRun {
         final List<String> disks = new ArrayList<>();
         final List<String> shares = new ArrayList<>();
         boolean net = false;
+        boolean dhcp = false;
         boolean oc2 = false;
         boolean serial = false;
         String builtinDir = null;
@@ -105,6 +109,7 @@ public final class SednaRun {
                 case "--disk" -> disks.add(args[++i]);
                 case "--share" -> shares.add(args[++i]);
                 case "--net" -> net = true;
+                case "--dhcp" -> net = dhcp = true;
                 case "--oc2" -> oc2 = true;
                 case "--serial" -> serial = true;
                 case "--builtin" -> builtinDir = args[++i];
@@ -192,10 +197,14 @@ public final class SednaRun {
             device.getInterrupt().set(irq++, board.getInterruptController());
             board.addDevice(device);
         }
+        Dhcp dhcpServer = null;
         if (net) {
             final VirtIONetworkDevice device = new VirtIONetworkDevice(board.getMemoryMap());
             device.getInterrupt().set(irq++, board.getInterruptController());
             board.addDevice(device);
+            if (dhcp) {
+                dhcpServer = new Dhcp(device);
+            }
         }
         // Cards come after the built-in devices, as in OC2.
         UART16550A serialUart = null;
@@ -245,6 +254,9 @@ public final class SednaRun {
             board.step(cyclesPerStep);
             if (hlapi != null) {
                 hlapi.pump();
+            }
+            if (dhcpServer != null) {
+                dhcpServer.pump();
             }
             if (serialUart != null) {
                 int b;
@@ -324,6 +336,226 @@ public final class SednaRun {
             p.load(stream);
         }
         return Integer.parseInt(p.getProperty("regionSize"));
+    }
+
+    // --dhcp: what sits at the other end of the network card's cable. A DHCP
+    // server for one client, and ARP and ICMP echo for its own address, so a
+    // guest can get a lease and ping its router. Frames are raw Ethernet.
+    static final class Dhcp {
+        private static final byte[] MAC = {0x02, 0x53, 0x45, 0x44, 0x4e, 0x41};
+        private static final byte[] SERVER = {10, 0, 2, 2};
+        private static final byte[] CLIENT = {10, 0, 2, 15};
+        private static final byte[] NETMASK = {(byte) 255, (byte) 255, (byte) 255, 0};
+        private static final byte[] BROADCAST = {(byte) 255, (byte) 255, (byte) 255, (byte) 255};
+        private static final int LEASE_SECONDS = 3600;
+
+        private final VirtIONetworkDevice device;
+
+        Dhcp(final VirtIONetworkDevice device) {
+            this.device = device;
+        }
+
+        void pump() {
+            byte[] frame;
+            while ((frame = device.readEthernetFrame()) != null) {
+                final byte[] reply = handle(frame);
+                if (reply != null) {
+                    device.writeEthernetFrame(reply);
+                }
+            }
+        }
+
+        private static byte[] handle(final byte[] f) {
+            if (f.length < 14) {
+                return null;
+            }
+            final int type = u16(f, 12);
+            if (type == 0x0806) {
+                return arp(f);
+            }
+            if (type != 0x0800 || f.length < 34 || (f[14] & 0xf0) != 0x40) {
+                return null;
+            }
+            final int ip = 14;
+            final int ihl = (f[ip] & 0x0f) * 4;
+            final int protocol = f[ip + 9] & 0xff;
+            final int l4 = ip + ihl;
+            if (protocol == 17 && f.length >= l4 + 8 && u16(f, l4 + 2) == 67) {
+                return dhcp(f, l4 + 8);
+            }
+            if (protocol == 1 && f.length >= l4 + 8 && (f[l4] & 0xff) == 8
+                && java.util.Arrays.equals(f, ip + 16, ip + 20, SERVER, 0, 4)) {
+                return echoReply(f, ip, ihl, l4);
+            }
+            return null;
+        }
+
+        // ARP requests for the server's address.
+        private static byte[] arp(final byte[] f) {
+            final int a = 14;
+            if (f.length < a + 28 || u16(f, a + 6) != 1
+                || !java.util.Arrays.equals(f, a + 24, a + 28, SERVER, 0, 4)) {
+                return null;
+            }
+            final byte[] r = new byte[a + 28];
+            System.arraycopy(f, 6, r, 0, 6);
+            System.arraycopy(MAC, 0, r, 6, 6);
+            put16(r, 12, 0x0806);
+            System.arraycopy(f, a, r, a, 6);         // htype, ptype, hlen, plen
+            put16(r, a + 6, 2);                      // reply
+            System.arraycopy(MAC, 0, r, a + 8, 6);
+            System.arraycopy(SERVER, 0, r, a + 14, 4);
+            System.arraycopy(f, a + 8, r, a + 18, 10); // the asker's MAC and IP
+            return r;
+        }
+
+        private static byte[] echoReply(final byte[] f, final int ip, final int ihl, final int l4) {
+            final int total = u16(f, ip + 2);
+            if (f.length < ip + total) {
+                return null;
+            }
+            final byte[] r = java.util.Arrays.copyOf(f, ip + total);
+            System.arraycopy(f, 6, r, 0, 6);
+            System.arraycopy(MAC, 0, r, 6, 6);
+            System.arraycopy(f, ip + 16, r, ip + 12, 4);
+            System.arraycopy(f, ip + 12, r, ip + 16, 4);
+            r[ip + 8] = 64;
+            put16(r, ip + 10, 0);
+            put16(r, ip + 10, checksum(r, ip, ihl));
+            r[l4] = 0;                               // echo reply
+            put16(r, l4 + 2, 0);
+            put16(r, l4 + 2, checksum(r, l4, ip + total - l4));
+            return r;
+        }
+
+        // DISCOVER gets an OFFER, REQUEST an ACK, always for CLIENT.
+        private static byte[] dhcp(final byte[] f, final int b) {
+            if (f.length < b + 240 || f[b] != 1 || u32(f, b + 236) != 0x63825363) {
+                return null;
+            }
+            int messageType = 0;
+            for (int o = b + 240; o < f.length && (f[o] & 0xff) != 255; ) {
+                final int code = f[o] & 0xff;
+                if (code == 0) {
+                    o++;
+                    continue;
+                }
+                if (o + 1 >= f.length) {
+                    break;
+                }
+                final int len = f[o + 1] & 0xff;
+                if (code == 53 && len >= 1 && o + 2 < f.length) {
+                    messageType = f[o + 2] & 0xff;
+                }
+                o += 2 + len;
+            }
+            final int replyType;
+            if (messageType == 1) {
+                replyType = 2;
+            } else if (messageType == 3) {
+                replyType = 5;
+            } else {
+                return null;
+            }
+            final byte[] mac = java.util.Arrays.copyOfRange(f, b + 28, b + 34);
+            System.out.printf("%n[SednaRun: DHCP %s from %s, %s %d.%d.%d.%d]%n",
+                messageType == 1 ? "DISCOVER" : "REQUEST", hex(mac),
+                replyType == 2 ? "offering" : "acknowledging",
+                CLIENT[0], CLIENT[1], CLIENT[2], CLIENT[3] & 0xff);
+
+            final ByteArrayOutputStream options = new ByteArrayOutputStream();
+            option(options, 53, new byte[]{(byte) replyType});
+            option(options, 54, SERVER);
+            option(options, 51, be32(LEASE_SECONDS));
+            option(options, 1, NETMASK);
+            option(options, 3, SERVER);
+            option(options, 6, SERVER);
+            options.write(255);
+
+            final byte[] bootp = new byte[Math.max(300, 240 + options.size())];
+            bootp[0] = 2;                            // BOOTREPLY
+            bootp[1] = 1;                            // Ethernet
+            bootp[2] = 6;
+            System.arraycopy(f, b + 4, bootp, 4, 4); // xid
+            System.arraycopy(f, b + 10, bootp, 10, 2); // flags
+            System.arraycopy(CLIENT, 0, bootp, 16, 4); // yiaddr
+            System.arraycopy(SERVER, 0, bootp, 20, 4); // siaddr
+            System.arraycopy(f, b + 28, bootp, 28, 16); // chaddr
+            put32(bootp, 236, 0x63825363);
+            final byte[] opts = options.toByteArray();
+            System.arraycopy(opts, 0, bootp, 240, opts.length);
+
+            // Broadcast: the client has no address yet.
+            final int ip = 14, udp = ip + 20, payload = udp + 8;
+            final byte[] r = new byte[payload + bootp.length];
+            java.util.Arrays.fill(r, 0, 6, (byte) 0xff);
+            System.arraycopy(MAC, 0, r, 6, 6);
+            put16(r, 12, 0x0800);
+            r[ip] = 0x45;
+            put16(r, ip + 2, 20 + 8 + bootp.length);
+            r[ip + 8] = 64;
+            r[ip + 9] = 17;
+            System.arraycopy(SERVER, 0, r, ip + 12, 4);
+            System.arraycopy(BROADCAST, 0, r, ip + 16, 4);
+            put16(r, ip + 10, checksum(r, ip, 20));
+            put16(r, udp, 67);
+            put16(r, udp + 2, 68);
+            put16(r, udp + 4, 8 + bootp.length);     // checksum 0: none
+            System.arraycopy(bootp, 0, r, payload, bootp.length);
+            return r;
+        }
+
+        private static void option(final ByteArrayOutputStream out, final int code, final byte[] value) {
+            out.write(code);
+            out.write(value.length);
+            out.writeBytes(value);
+        }
+
+        private static int checksum(final byte[] d, final int off, final int len) {
+            long sum = 0;
+            for (int i = 0; i < len; i += 2) {
+                sum += ((d[off + i] & 0xff) << 8) | (i + 1 < len ? d[off + i + 1] & 0xff : 0);
+            }
+            while ((sum >> 16) != 0) {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            return (int) (~sum & 0xffff);
+        }
+
+        private static int u16(final byte[] d, final int off) {
+            return ((d[off] & 0xff) << 8) | (d[off + 1] & 0xff);
+        }
+
+        private static long u32(final byte[] d, final int off) {
+            return ((long) u16(d, off) << 16) | u16(d, off + 2);
+        }
+
+        private static void put16(final byte[] d, final int off, final int v) {
+            d[off] = (byte) (v >> 8);
+            d[off + 1] = (byte) v;
+        }
+
+        private static void put32(final byte[] d, final int off, final long v) {
+            put16(d, off, (int) (v >> 16));
+            put16(d, off + 2, (int) v);
+        }
+
+        private static byte[] be32(final int v) {
+            final byte[] d = new byte[4];
+            put32(d, 0, v);
+            return d;
+        }
+
+        private static String hex(final byte[] mac) {
+            final StringBuilder sb = new StringBuilder();
+            for (final byte x : mac) {
+                if (sb.length() > 0) {
+                    sb.append(':');
+                }
+                sb.append(String.format("%02x", x & 0xff));
+            }
+            return sb.toString();
+        }
     }
 
     // ------------------------------------------------------------------ //

@@ -1,0 +1,8 @@
+#
+# ttys(5). A login prompt on the console, the hypervisor's virtual terminal,
+# which OC2 puts on the computer's serial port; root has no password. The
+# terminal type is screen, which is what OC2's terminal speaks. The getty
+# entry is in /etc/gettytab.
+#
+# name	getty				type	status	comments
+console	"/usr/libexec/getty power.console"	screen	on	secure

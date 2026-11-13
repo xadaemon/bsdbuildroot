@@ -1,0 +1,80 @@
+Getting started with Sedna FreeBSD
+==================================
+
+This is FreeBSD running on an OpenComputers II computer. It is a small
+system: about 90 regular FreeBSD programs, 32 MB of memory at most, and a
+40 MB drive with ~6 MB free on /. Read this file with `less` (q quits).
+
+The basics
+----------
+  passwd                  root has no password; set one
+  ee FILE                 edit a file (Esc opens the menu)
+  less FILE               read a file
+  top, ps aux, df -h      what runs, and how full the disks are
+  poweroff, reboot        shut down cleanly; the computer's power button
+                          does the same
+
+The drive keeps what you write. Breaking the computer cuts the power
+without a shutdown; the file system is then checked and repaired at the
+next boot.
+
+Talking to blocks: the high-level API
+-------------------------------------
+OC2's Lua libraries work as in the in-game manual:
+
+  lsdev.lua               the devices on the bus, with their type names
+  redstone.lua up 15      OC2's example: redstone output up, level 15
+
+or in Lua:
+
+  r = require("devices"):find("redstone")
+  r:setRedstoneOutput("up", 15)
+
+The mid-level API, from the shell
+---------------------------------
+  mlapi list              devices on the mid-level API
+  mlapi call REDSTN 3 1 15
+                          call a function (here: redstone output up, 15)
+  mlapi events            wait for events
+
+More hard drives
+----------------
+  initdisks               list the other drives and what is on them
+  initdisks -a            set up every blank drive (mounted at /mnt/diskN)
+  initdisks vtbd1 games   one drive, mounted at /mnt/games
+
+Set-up drives are mounted at boot, also in other computers.
+
+Serial interface cards
+----------------------
+The first card is /dev/ttyS1:
+
+  stty -F /dev/ttyS1 9600 raw -echo -crtscts
+
+Network
+-------
+A network card shows up as vtnet0. To give it an address by hand:
+
+  ifconfig vtnet0 inet 10.0.0.2/24 up
+  route add default 10.0.0.1          (if the network has a router)
+  ping 10.0.0.1
+
+The DHCP client is off by default, as an OC2 network has no DHCP server
+unless another computer runs one. To use it on every network card from the
+next boot on (put card names in the file to use it on only those):
+
+  touch /etc/dhclient.enabled
+  sh /etc/rc.d/S20dhclient start      (start it right now)
+
+To keep any other setting across reboots, put the commands in a script
+/etc/rc.d/S??name (run at boot in order, with the argument "start").
+
+The host name is localhost:
+
+  hostname myhost && echo myhost > /etc/hostname
+
+Memory
+------
+16 MB of the drive is swap space, so idle programs make room for others.
+OC2's bus daemon, oc2busd, is protected from being killed when memory runs
+out; touch /etc/oc2busd.disabled to not start it at all.

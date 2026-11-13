@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# The machine's other disks and striped volumes, mounted at /mnt/<name>:
+# mountdisks(8), /usr/sbin/mountdisks, does the work. After the kernel
+# modules are loaded (kld): a striped volume needs its GEOM class.
+#
+
+# PROVIDE: mountdisks
+# REQUIRE: FILESYSTEMS kld
+# BEFORE: DAEMON
+# KEYWORD: nojail shutdown
+
+. /etc/rc.subr
+
+name="mountdisks"
+desc="Mount the other disks at /mnt"
+rcvar="mountdisks_enable"
+start_cmd="/usr/sbin/mountdisks"
+stop_cmd="/usr/sbin/mountdisks -u"
+
+load_rc_config $name
+: ${mountdisks_enable:="YES"}
+mountdisks_svcj="NO"
+run_rc_command "$1"

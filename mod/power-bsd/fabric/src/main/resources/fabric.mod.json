@@ -1,0 +1,23 @@
+{
+    "schemaVersion": 1,
+    "id": "power_bsd",
+    "version": "${version}",
+    "name": "Power BSD",
+    "description": "FreeBSD for OpenComputers II's tier 5 (PowerPC) computer: the stock FreeBSD release, installed on a bootable hard drive image, as a data pack in every world. The version is the FreeBSD release on the image and the image's build number.",
+    "authors": [
+        "Matheus Xavier"
+    ],
+    "license": "BSD-2-Clause",
+    "environment": "*",
+    "entrypoints": {
+        "main": [
+            "power_bsd.fabric.PowerBSDFabric"
+        ]
+    },
+    "depends": {
+        "fabricloader": ">=0.15.0",
+        "minecraft": "${minecraftVersion}",
+        "fabric-resource-loader-v0": "*",
+        "oc2": "*"
+    }
+}

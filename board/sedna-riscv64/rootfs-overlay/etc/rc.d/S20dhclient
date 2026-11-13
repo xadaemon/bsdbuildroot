@@ -1,0 +1,52 @@
+#!/bin/sh
+#
+# DHCP client, dhclient(8), on the network cards. Off by default: an OC2
+# network has no DHCP server unless another computer runs one. To turn it
+# on, for every network card:
+#
+#   touch /etc/dhclient.enabled
+#
+# or name the cards (vtnet0, ...) in that file, one or more per line, for
+# only those. dhclient goes to the background at once (-b), so boot does not
+# wait for a lease. The address, router and name servers it gets are set up
+# by dhclient-script(8); leases are kept in /var/db/dhclient.leases.<card>.
+#
+
+ENABLED=/etc/dhclient.enabled
+PIDDIR=/var/run/dhclient
+
+interfaces() {
+	list=$(sed -e 's/#.*//' "$ENABLED")
+	if [ -n "$(echo $list)" ]; then
+		echo $list
+	else
+		ifconfig -l ether
+	fi
+}
+
+start() {
+	[ -f "$ENABLED" ] || return 0
+	# /etc/rc empties /var/run at boot.
+	mkdir -p "$PIDDIR"
+	for ifn in $(interfaces); do
+		printf 'Starting dhclient on %s: ' "$ifn"
+		dhclient -b "$ifn" && echo OK
+	done
+}
+
+stop() {
+	for pidfile in "$PIDDIR"/dhclient.*.pid; do
+		[ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null
+	done
+	return 0
+}
+
+case "$1" in
+	start|stop)
+		"$1" ;;
+	restart)
+		stop; sleep 1; start ;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1 ;;
+esac

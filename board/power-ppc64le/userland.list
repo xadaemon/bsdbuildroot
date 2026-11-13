@@ -1,0 +1,127 @@
+# What the Power BSD image has on top of board/common/userland.list, in the
+# same format, from FreeBSD's release sets.
+
+# --- /boot: Open Firmware's loader(8), Forth flavour, and the stock kernel
+# (GENERIC64LE). post-build.sh compresses the kernel, the loader unpacks it.
+# The kernel has what the machine needs built in. Of the release's modules
+# (56 MB of them) only what something here uses: GEOM's stripe class, which
+# rc.conf's kld_list loads at boot. To add a module, list it here; kldxref
+# makes /boot/kernel/linker.hints at the first boot, with which the kernel
+# finds the modules a module needs.
+boot/loader
+boot/loader.rc
+boot/loader.help.ofw
+boot/menu.rc
+boot/*.4th
+boot/defaults
+boot/kernel/kernel
+boot/kernel/geom_stripe.ko
+
+# --- programs
+bin/freebsd-version
+# Kernel modules: load, list, unload.
+sbin/kldload
+sbin/kldstat
+sbin/kldunload
+# geom(8), and gstripe(8) with its class library: one volume striped over
+# several drives, see "More hard drives" in /root/getting_started.txt.
+sbin/geom
+sbin/gstripe
+lib/geom/geom_stripe.so
+usr/bin/tar
+usr/bin/vi
+
+# The device bus: ofwdump reads the device tree, where the consoles of the
+# high-level API are labelled (see /etc/rc.d/oc2ports); pciconf lists the PCI
+# devices, the mid-level API's among them.
+usr/sbin/ofwdump
+usr/sbin/pciconf
+
+# --- FreeBSD's own init system, rc(8): /etc/rc runs the scripts in
+# /etc/rc.d in the order of their dependencies (rcorder), as /etc/rc.conf
+# and /etc/defaults/rc.conf set them up. service(8) runs one of them,
+# sysrc(8) reads and changes rc.conf.
+etc/rc
+etc/rc.subr
+etc/rc.shutdown
+etc/network.subr
+etc/defaults/rc.conf
+etc/defaults/devfs.rules
+etc/devfs.conf
+etc/sysctl.conf
+sbin/rcorder
+usr/sbin/service
+usr/sbin/sysrc
+usr/share/bsdconfig/common.subr
+usr/share/bsdconfig/sysrc.subr
+usr/libexec/bsdconfig/include/messages.subr
+# What rc.subr and the scripts below run.
+bin/chflags
+bin/pwait
+bin/uuidgen
+sbin/md5
+sbin/route
+usr/bin/fsync
+usr/bin/install
+usr/bin/limits
+usr/sbin/kldxref
+usr/sbin/utx
+# cron(8), and newsyslog(8), which it runs every hour: the logs are on a
+# small memory file system (/etc/crontab, /etc/newsyslog.conf).
+usr/sbin/cron
+usr/bin/crontab
+var/cron
+usr/sbin/newsyslog
+
+# The rc.d scripts: not all 171 of the release, those of what the image has
+# programs for. A script that is missing is no error: nothing is started,
+# whatever rc.conf says. With a program added above, add its script too.
+# The image's own are in the overlay: mountdisks, oc2ports, oc2busd.
+#
+# The milestones other scripts are ordered by.
+etc/rc.d/FILESYSTEMS
+etc/rc.d/NETWORKING
+etc/rc.d/SERVERS
+etc/rc.d/DAEMON
+etc/rc.d/LOGIN
+# File systems: check them, mount them, clean up.
+etc/rc.d/fsck
+etc/rc.d/root
+etc/rc.d/mdconfig
+etc/rc.d/mdconfig2
+etc/rc.d/mountcritlocal
+etc/rc.d/mountcritremote
+etc/rc.d/mountlate
+etc/rc.d/swap
+etc/rc.d/swaplate
+etc/rc.d/tmp
+etc/rc.d/var
+etc/rc.d/cleanvar
+# The kernel: modules (kld_list), sysctl.conf, devfs.conf, the boot
+# messages in /var/run/dmesg.boot, entropy kept over a restart.
+etc/rc.d/kldxref
+etc/rc.d/kld
+etc/rc.d/sysctl
+etc/rc.d/sysctl_lastload
+etc/rc.d/securelevel
+etc/rc.d/devfs
+etc/rc.d/dmesg
+etc/rc.d/random
+# The host: its name, an id of its own (/etc/hostid, made at the first
+# boot), shared libraries, /var/run/os-release, who is logged in.
+etc/rc.d/hostname
+etc/rc.d/hostid
+etc/rc.d/hostid_save
+etc/rc.d/ldconfig
+etc/rc.d/os-release
+etc/os-release
+etc/rc.d/utx
+# The network: lo0, and interfaces and routes set in rc.conf.
+etc/rc.d/netif
+etc/rc.d/netoptions
+etc/rc.d/routing
+# Daemons, and /etc/rc.local.
+etc/rc.d/newsyslog
+etc/rc.d/syslogd
+etc/rc.d/cron
+etc/rc.d/local

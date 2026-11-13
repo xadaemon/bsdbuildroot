@@ -1,0 +1,12 @@
+# /etc/crontab: the system's crontab, see crontab(5). cron(8) reads it again
+# when it changes.
+#
+SHELL=/bin/sh
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+# What a command prints would be mailed; there is no mail here.
+MAILTO=""
+#
+#minute	hour	mday	month	wday	who	command
+#
+# Turn the logs over, if they are large: /etc/newsyslog.conf.
+0	*	*	*	*	root	newsyslog
